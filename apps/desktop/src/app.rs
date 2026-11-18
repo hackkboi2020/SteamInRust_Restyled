@@ -140,6 +140,8 @@ pub struct SteamApp {
     applied_zoom: f32,
     /// Sharp window icons for the display's scaling (Windows).
     window_icon: crate::window_icon::WindowIcon,
+    /// The saved logo was handed to the tray and taskbar again after startup.
+    icons_refreshed: bool,
     /// Big Picture (fullscreen TV mode) and its controller input.
     pub bigpicture: crate::bigpicture::BigPicture,
     bigpicture_was_on: bool,
@@ -271,6 +273,7 @@ impl SteamApp {
             applied_theme: None,
             applied_zoom: 0.0,
             window_icon: Default::default(),
+            icons_refreshed: false,
             bigpicture,
             bigpicture_was_on: false,
             swipe: (egui::Vec2::ZERO, 0.0, false),
@@ -702,6 +705,14 @@ impl eframe::App for SteamApp {
         // The running download (not a file check) on the taskbar / Dock.
         let shown = self.state.downloads.values().find(|d| !matches!(d.phase, model::DownloadPhase::Done | model::DownloadPhase::Failed) && !d.verifying()).map(|d| (d.fraction(), d.paused));
         self.taskbar.show(frame, shown);
+        // Once a moment after startup, give the tray and the taskbar the saved
+        // logo again: right at startup Windows can keep showing the icon it
+        // had before.
+        if !self.icons_refreshed && ctx.input(|i| i.time) > 2.0 {
+            self.icons_refreshed = true;
+            self.tray.set_icon(self.prefs.tray_icon);
+            self.window_icon.refresh();
+        }
         self.window_icon.show(frame, self.prefs.tray_icon);
         crate::image_cache::trim_decoded(&ctx);
         if self.applied_theme.as_ref() != Some(&self.prefs.theme) {

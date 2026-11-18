@@ -26,7 +26,7 @@ pub fn show(app: &mut SteamApp, ctx: &egui::Context, actions: &mut Vec<Action>) 
         .with_inner_size([width, 720.0])
         .with_min_inner_size([300.0, 420.0])
         .with_decorations(crate::chrome::SYSTEM_FRAME)
-        .with_icon(std::sync::Arc::new(egui::IconData { rgba: app.prefs.tray_icon.rgba(64), width: 64, height: 64 }));
+        .with_icon(crate::window_icon::icon_data(app.prefs.tray_icon, 64));
     if !app.can_open_window(ctx, egui::ViewportId::from_hash_of("friends-window")) {
         return;
     }

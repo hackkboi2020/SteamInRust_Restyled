@@ -16,6 +16,14 @@ pub struct WindowIcon {
 }
 
 impl WindowIcon {
+    /// Hand the icons to the window again on the next frame.
+    pub fn refresh(&mut self) {
+        #[cfg(windows)]
+        {
+            self.drawn = None;
+        }
+    }
+
     /// Draws the icons for the window's scaling and `logo`, and again when
     /// either changes (moved to another display, another logo picked).
     /// Elsewhere the system takes the app's icon from its bundle.
@@ -46,6 +54,16 @@ impl WindowIcon {
         }
         self.drawn = Some((dpi, logo));
     }
+}
+
+/// A window icon of `logo` at `size`, drawn once and kept (viewport
+/// builders are made every frame).
+pub fn icon_data(logo: ui::brand::Logo, size: u32) -> std::sync::Arc<egui::IconData> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Option<HashMap<(ui::brand::Logo, u32), Arc<egui::IconData>>>> = Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    cache.get_or_insert_with(HashMap::new).entry((logo, size)).or_insert_with(|| Arc::new(egui::IconData { rgba: logo.rgba(size), width: size, height: size })).clone()
 }
 
 /// Size to draw the tray icon at: the small-icon size Windows uses for the
