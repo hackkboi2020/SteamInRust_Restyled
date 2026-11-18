@@ -62,7 +62,7 @@ pub struct AppFlags {
     /// Pop-ups for new chat messages / Steam notifications.
     pub toast_messages: bool,
     pub toast_notifications: bool,
-    /// Which version of the logo the tray icon shows.
+    /// Which version of the logo the taskbar button and tray icon show.
     pub tray_icon: ui::brand::Logo,
 }
 
@@ -461,8 +461,8 @@ fn appearance(ui: &mut Ui, t: &Theme, ctx: &mut Ctx, flags: &SharedFlags) {
 /// color, like the theme tiles.
 fn tray_icon_picker(ui: &mut Ui, t: &Theme, flags: &SharedFlags) {
     use ui::brand::Logo;
-    ui.label(w::text_semibold(t!("Tray icon"), 15.0, t.text));
-    ui.label(w::text(t!("The logo SteamInRust shows in the system tray."), 12.5, t.text_dim));
+    ui.label(w::text_semibold(t!("App icon"), 15.0, t.text));
+    ui.label(w::text(t!("The logo SteamInRust shows on the taskbar and in the system tray."), 12.5, t.text_dim));
     ui.add_space(8.0);
     let mut current = flags.lock().unwrap().tray_icon;
     ui.horizontal_wrapped(|ui| {

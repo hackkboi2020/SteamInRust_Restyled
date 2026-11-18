@@ -44,7 +44,7 @@ pub struct Prefs {
     pub bigpicture_scale: f32,
     /// Open in Big Picture at startup.
     pub bigpicture_start: bool,
-    /// Which version of the logo the tray icon shows.
+    /// Which version of the logo the taskbar button and tray icon show.
     pub tray_icon: ui::brand::Logo,
 }
 
@@ -702,7 +702,7 @@ impl eframe::App for SteamApp {
         // The running download (not a file check) on the taskbar / Dock.
         let shown = self.state.downloads.values().find(|d| !matches!(d.phase, model::DownloadPhase::Done | model::DownloadPhase::Failed) && !d.verifying()).map(|d| (d.fraction(), d.paused));
         self.taskbar.show(frame, shown);
-        self.window_icon.show(frame);
+        self.window_icon.show(frame, self.prefs.tray_icon);
         crate::image_cache::trim_decoded(&ctx);
         if self.applied_theme.as_ref() != Some(&self.prefs.theme) {
             self.prefs.theme.apply(&ctx);
