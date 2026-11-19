@@ -288,7 +288,16 @@ fn inventory(me: u64, now: u64) -> Vec<Event> {
     out.push(Event::ProfileEdit(Ok(model::ProfileEdit {
         persona_name: "You".into(),
         custom_url: "demo-player".into(),
-        summary: "Collector of indie gems and long co-op nights.".into(),
+        // Several paragraphs and one long unbroken line, like real summaries.
+        summary: "Collector of indie gems and long co-op nights.
+
+Currently: replaying Hades on the hardest heat, slowly finishing Stardew Valley's community center, and trying every Portal 2 workshop map my friends send me.
+
+Add me if you want to play co-op, trade cards or just chat about games. I'm usually online in the evenings (Europe).
+
+https://steamcommunity.com/sharedfiles/filedetails/?id=1234567890&searchtext=co-op-night-collection-favourites
+
+No trades for Steam keys, sorry.".into(),
         privacy: model::ProfilePrivacy { profile: 3, inventory: 3, gifts: 1, games: 3, playtime: 1, friends: 2, comments: 1 },
         // Made-up items you own, with game art standing in for their pictures.
         // As Steam sends them: ids with "#ProfileTheme_…" keys for titles.
