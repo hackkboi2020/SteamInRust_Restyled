@@ -2508,3 +2508,16 @@
 "Top right" = "右上"
 "Bottom left" = "左下"
 "Bottom right" = "右下"
+
+# --- Community: post a status ---
+"Post a status for your friends…" = "发布动态给你的好友…"
+"Tag with game" = "标记游戏"
+"No game" = "不标记游戏"
+"Find a game" = "查找游戏"
+"Post|status" = "发布"
+"Status posted" = "动态已发布"
+"Couldn't post your status: {error}" = "无法发布动态：{error}"
+"Your friends see what you post here." = "你的好友会看到你在这里发布的内容。"
+"The status is empty" = "动态为空"
+"Sign in to post a status" = "登录以发布动态"
+"Posting status updates is unavailable right now" = "目前无法发布动态"

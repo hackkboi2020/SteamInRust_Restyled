@@ -2508,3 +2508,16 @@
 "Top right" = "Справа вверху"
 "Bottom left" = "Слева внизу"
 "Bottom right" = "Справа внизу"
+
+# --- Community: post a status ---
+"Post a status for your friends…" = "Напишите что-нибудь для друзей…"
+"Tag with game" = "Отметить игру"
+"No game" = "Без игры"
+"Find a game" = "Найти игру"
+"Post|status" = "Опубликовать"
+"Status posted" = "Запись опубликована"
+"Couldn't post your status: {error}" = "Не удалось опубликовать запись: {error}"
+"Your friends see what you post here." = "Это увидят ваши друзья."
+"The status is empty" = "Запись пустая"
+"Sign in to post a status" = "Войдите, чтобы опубликовать запись"
+"Posting status updates is unavailable right now" = "Публикация записей сейчас недоступна"

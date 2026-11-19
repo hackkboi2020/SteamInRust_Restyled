@@ -2508,3 +2508,16 @@
 "Top right" = "Canto superior direito"
 "Bottom left" = "Canto inferior esquerdo"
 "Bottom right" = "Canto inferior direito"
+
+# --- Community: post a status ---
+"Post a status for your friends…" = "Publique um status para seus amigos…"
+"Tag with game" = "Marcar um jogo"
+"No game" = "Nenhum jogo"
+"Find a game" = "Procurar um jogo"
+"Post|status" = "Publicar"
+"Status posted" = "Status publicado"
+"Couldn't post your status: {error}" = "Não foi possível publicar o status: {error}"
+"Your friends see what you post here." = "Seus amigos verão o que você publicar aqui."
+"The status is empty" = "O status está vazio"
+"Sign in to post a status" = "Entre para publicar um status"
+"Posting status updates is unavailable right now" = "No momento não é possível publicar status"

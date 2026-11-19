@@ -2508,3 +2508,16 @@
 "Top right" = "Oben rechts"
 "Bottom left" = "Unten links"
 "Bottom right" = "Unten rechts"
+
+# --- Community: post a status ---
+"Post a status for your friends…" = "Schreib einen Status für deine Freunde…"
+"Tag with game" = "Spiel markieren"
+"No game" = "Kein Spiel"
+"Find a game" = "Spiel suchen"
+"Post|status" = "Posten"
+"Status posted" = "Status gepostet"
+"Couldn't post your status: {error}" = "Status konnte nicht gepostet werden: {error}"
+"Your friends see what you post here." = "Deine Freunde sehen, was du hier postest."
+"The status is empty" = "Der Status ist leer"
+"Sign in to post a status" = "Melde dich an, um einen Status zu posten"
+"Posting status updates is unavailable right now" = "Status können gerade nicht gepostet werden"

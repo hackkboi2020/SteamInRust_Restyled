@@ -842,7 +842,8 @@ impl eframe::App for SteamApp {
     /// Previews of an `--offscreen` copy can't be pointed at with the real
     /// mouse: `--pointer=x,y` keeps a pretend pointer there (hover states),
     /// and `--click=x,y` clicks there once, 4 seconds in (or
-    /// `--click-after=<seconds>`).
+    /// `--click-after=<seconds>`; `--type=<text>` then types into what it
+    /// focused, `--type-submit` adds Ctrl+Enter).
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         if !offscreen() || raw_input.viewport_id != egui::ViewportId::ROOT {
             return;
@@ -870,6 +871,19 @@ impl eframe::App for SteamApp {
                 raw_input.events.push(egui::Event::PointerButton { pos: p, button: egui::PointerButton::Primary, pressed: false, modifiers });
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            // `--type=<text>`: typed into what the click focused, a moment
+            // later; `--type-submit` then presses Ctrl+Enter.
+            if let Some(text) = std::env::args().find_map(|a| a.strip_prefix("--type=").map(String::from)) {
+                let typed = ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("preview-typed"))).unwrap_or(false);
+                if done && time > after + 0.5 && !typed {
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("preview-typed"), true));
+                    raw_input.events.push(egui::Event::Text(text));
+                    if std::env::args().any(|a| a == "--type-submit") {
+                        let modifiers = egui::Modifiers::COMMAND;
+                        raw_input.events.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers });
+                    }
+                }
+            }
         }
     }
 

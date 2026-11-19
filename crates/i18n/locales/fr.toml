@@ -2508,3 +2508,16 @@
 "Top right" = "En haut à droite"
 "Bottom left" = "En bas à gauche"
 "Bottom right" = "En bas à droite"
+
+# --- Community: post a status ---
+"Post a status for your friends…" = "Publiez un statut pour vos amis…"
+"Tag with game" = "Associer un jeu"
+"No game" = "Aucun jeu"
+"Find a game" = "Chercher un jeu"
+"Post|status" = "Publier"
+"Status posted" = "Statut publié"
+"Couldn't post your status: {error}" = "Impossible de publier le statut : {error}"
+"Your friends see what you post here." = "Vos amis verront ce que vous publiez ici."
+"The status is empty" = "Le statut est vide"
+"Sign in to post a status" = "Connectez-vous pour publier un statut"
+"Posting status updates is unavailable right now" = "La publication de statuts est indisponible pour le moment"
