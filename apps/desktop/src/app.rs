@@ -832,6 +832,39 @@ impl SteamApp {
     }
 }
 
+/// `--keys=Down;Down;Enter;text:hello;wheel:960:540:-300;wait` (with
+/// `--offscreen`): replays keys, typing and mouse-wheel turns into a preview
+/// copy, one every 0.4 s from 4 s in (`--keys-after=<seconds>`), so screens
+/// that need the keyboard or a controller can be checked off-screen. Keys
+/// use egui's names (Down, Enter, Escape, Backspace, Q…).
+fn preview_keys(ctx: &egui::Context, raw_input: &mut egui::RawInput, time: f64) {
+    let Some(list) = std::env::args().find_map(|a| a.strip_prefix("--keys=").map(String::from)) else { return };
+    let after = std::env::args().find_map(|a| a.strip_prefix("--keys-after=").and_then(|v| v.parse::<f64>().ok())).unwrap_or(4.0);
+    let steps: Vec<&str> = list.split(';').collect();
+    let id = egui::Id::unique("preview-keys-done");
+    let done = ctx.data(|d| d.get_temp::<usize>(id)).unwrap_or(0);
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    if done >= steps.len() || time < after + done as f64 * 0.4 {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, done + 1));
+    let step = steps[done];
+    let modifiers = egui::Modifiers::NONE;
+    if let Some(text) = step.strip_prefix("text:") {
+        raw_input.events.push(egui::Event::Text(text.to_string()));
+    } else if let Some(w) = step.strip_prefix("wheel:") {
+        let n: Vec<f32> = w.split(':').filter_map(|v| v.parse().ok()).collect();
+        if let [x, y, dy] = n[..] {
+            raw_input.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+            raw_input.events.push(egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Unknown, modifiers });
+        }
+    } else if let Some(key) = egui::Key::from_name(step) {
+        for pressed in [true, false] {
+            raw_input.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers });
+        }
+    }
+}
+
 impl eframe::App for SteamApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Transparent so the overlay window can see through; the main window
@@ -871,6 +904,7 @@ impl eframe::App for SteamApp {
             }
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
+        preview_keys(ctx, raw_input, time);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {

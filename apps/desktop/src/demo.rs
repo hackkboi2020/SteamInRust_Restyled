@@ -51,7 +51,17 @@ pub fn events(local: &local::LocalState) -> Vec<Event> {
 
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let ferris = BASE + 100;
+    // Long enough to scroll (chat screens), with one long message.
     let chat = [
+        (ferris, "did you finish the last chapter?", 86_400 + 4_000),
+        (me, "almost! stuck on the bridge part", 86_400 + 3_900),
+        (ferris, "the trick is to place the portal on the far wall first, then jump while the light bridge is still moving. it took me like twenty tries before I noticed the panel behind the glass", 86_400 + 3_800),
+        (me, "ohh that makes sense", 86_400 + 3_700),
+        (me, "got it, thanks!", 86_400 + 3_000),
+        (ferris, "nice", 86_400 + 2_900),
+        (ferris, "want to try the co-op campaign this week?", 7_200),
+        (me, "yes, any evening works", 7_000),
+        (ferris, "cool", 6_900),
         (ferris, "hey, portal 2 co-op tonight?", 600),
         (me, "sure, after dinner", 540),
         (ferris, "nice. I'll send an invite around 8", 500),
