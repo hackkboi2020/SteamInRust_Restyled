@@ -269,7 +269,7 @@ impl SteamApp {
         let local = if std::env::args().any(|a| a == "--no-local") {
             LocalState::default()
         } else {
-            local::load(None).unwrap_or_else(|e| {
+            client::store::load_local(None).unwrap_or_else(|e| {
                 tracing::warn!("local Steam library: {e}");
                 LocalState::default()
             })
@@ -478,7 +478,7 @@ impl SteamApp {
                 }
                 Event::GameStopped { .. } => {
                     self.overlay.game_stopped();
-                    if let Ok(l) = local::load(Some(self.local.steam_root.clone())) {
+                    if let Ok(l) = client::store::load_local(Some(self.local.steam_root.clone())) {
                         self.local = l;
                     }
                 }
@@ -630,7 +630,7 @@ impl SteamApp {
                 }
                 Action::OpenChat(id) => self.friends_window.show(crate::friends_window::Pane::Chat(id)),
                 Action::ReloadLocal => {
-                    if let Ok(l) = local::load(Some(self.local.steam_root.clone())) {
+                    if let Ok(l) = client::store::load_local(Some(self.local.steam_root.clone())) {
                         self.local = l;
                     }
                 }

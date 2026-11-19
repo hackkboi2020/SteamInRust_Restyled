@@ -493,6 +493,7 @@
 "Parallel connections" = "Parallele Verbindungen"
 "SteamInRust measures Steam's content servers and uses the fastest one, reuses unchanged parts of games when updating, and checks every piece as it arrives." = "SteamInRust misst die Inhaltsserver von Steam und nutzt den schnellsten, verwendet beim Aktualisieren unveränderte Teile wieder und prüft jedes Stück beim Eintreffen."
 "{name} is ready to play" = "{name} ist spielbereit"
+"{name} is already installed in {folder}" = "{name} ist bereits in {folder} installiert"
 "Download failed: {error}" = "Download fehlgeschlagen: {error}"
 "Added to downloads" = "Zu den Downloads hinzugefügt"
 

@@ -493,6 +493,7 @@
 "Parallel connections" = "Параллельные соединения"
 "SteamInRust measures Steam's content servers and uses the fastest one, reuses unchanged parts of games when updating, and checks every piece as it arrives." = "SteamInRust сам выбирает самый быстрый сервер Steam, при обновлении повторно использует неизменившиеся части игры и проверяет каждый загруженный фрагмент."
 "{name} is ready to play" = "{name} готова к игре"
+"{name} is already installed in {folder}" = "{name} уже установлена в {folder}"
 "Download failed: {error}" = "Не удалось загрузить: {error}"
 "Added to downloads" = "Добавлено в загрузки"
 

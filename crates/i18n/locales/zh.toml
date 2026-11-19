@@ -493,6 +493,7 @@
 "Parallel connections" = "并行连接数"
 "SteamInRust measures Steam's content servers and uses the fastest one, reuses unchanged parts of games when updating, and checks every piece as it arrives." = "SteamInRust 会测量 Steam 的内容服务器并使用最快的一台，更新时复用游戏中未改变的部分，并在每个数据块到达时进行校验。"
 "{name} is ready to play" = "{name} 已准备就绪"
+"{name} is already installed in {folder}" = "{name} 已安装在 {folder}"
 "Download failed: {error}" = "下载失败：{error}"
 "Added to downloads" = "已添加到下载"
 
