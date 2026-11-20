@@ -310,6 +310,9 @@ struct Online {
     personas: HashMap<SteamId, Persona>,
     apps: HashMap<AppId, OwnedApp>,
     playing: Option<AppId>,
+    /// A non-Steam game we're "playing": its shortcut-style game id, name and
+    /// rich presence line. Kept so a reconnect can tell Steam again.
+    local_playing: Option<(u64, String, Option<String>)>,
     /// Process ids of games we started.
     running: HashMap<AppId, u32>,
     cell_id: u32,
@@ -455,6 +458,7 @@ async fn online(
         personas: HashMap::new(),
         apps: HashMap::new(),
         playing: None,
+        local_playing: None,
         running: HashMap::new(),
         cell_id: info.cell_id,
         download_cell: None,
@@ -627,6 +631,18 @@ async fn online(
                 Some(Command::SetPersonaState(s)) => {
                     st.persona_state = s;
                     let _ = set_persona(&conn, s);
+                }
+                Some(Command::SetLocalPlaying { game_id, name, status }) => {
+                    st.local_playing = Some((game_id, name, status));
+                    if st.link == Link::Online {
+                        st.send_local_playing();
+                    }
+                }
+                Some(Command::ClearLocalPlaying) => {
+                    if st.local_playing.take().is_some() && st.link == Link::Online {
+                        // Don't clear a real Steam game we're also running.
+                        let _ = games_played(&conn, st.playing);
+                    }
                 }
                 Some(Command::JoinRunningGame { app_id, friend, connect }) => {
                     let lobby = lobby_of(&connect);
@@ -1359,7 +1375,12 @@ async fn online(
                 }
                 if st.playing == Some(app_id) {
                     st.playing = None;
-                    let _ = games_played(&conn, None);
+                    if st.local_playing.is_some() {
+                        // A non-Steam game is still running: keep showing it.
+                        st.send_local_playing();
+                    } else {
+                        let _ = games_played(&conn, None);
+                    }
                 }
                 sink(Event::GameStopped { app_id });
             }
@@ -1491,6 +1512,24 @@ fn games_played(conn: &Connection, app: Option<AppId>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Like [`games_played`] for a game that isn't on Steam: the game id is the
+/// shortcut-style one and the name goes in `game_extra_info`, which is what
+/// Steam's own client sends for a shortcut so friends see "Playing <name>".
+/// A Steam game we're also running stays in the list.
+fn games_played_local(conn: &Connection, steam_app: Option<AppId>, game_id: u64, name: &str) -> Result<(), Error> {
+    let mut list: Vec<c_msg_client_games_played::GamePlayed> = steam_app
+        .map(|id| c_msg_client_games_played::GamePlayed { game_id: Some(id as u64), ..Default::default() })
+        .into_iter()
+        .collect();
+    list.push(c_msg_client_games_played::GamePlayed {
+        game_id: Some(game_id),
+        game_extra_info: Some(name.to_string()),
+        ..Default::default()
+    });
+    conn.send(CLIENT_GAMES_PLAYED_WITH_DATA_BLOB, &CMsgClientGamesPlayed { games_played: list, client_os_type: Some(OS_TYPE_WIN11), ..Default::default() })?;
+    Ok(())
+}
+
 fn is_individual(id: SteamId) -> bool {
     (id >> 52) & 0xF == 1
 }
@@ -1500,6 +1539,18 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 impl Online {
+    /// Tell Steam about the non-Steam game we're playing, if any, with its
+    /// rich presence line (best effort: Steam shows the game's name for sure;
+    /// whether a custom status line is displayed for non-Steam games is up to
+    /// the friend's client).
+    fn send_local_playing(&self) {
+        let Some((game_id, name, status)) = &self.local_playing else { return };
+        let _ = games_played_local(&self.conn, self.playing, *game_id, name);
+        if let Some(text) = status.as_ref().filter(|s| !s.trim().is_empty()) {
+            crate::ipc::rich_presence(&self.conn, &[("status".to_string(), text.clone())]);
+        }
+    }
+
     /// Returns `Some` when the server ends the session.
     fn handle(
         &mut self,
@@ -2642,7 +2693,12 @@ impl Online {
         self.launched_dirs.insert(app_id, dir.to_path_buf());
         self.playing = Some(app_id);
         if self.link == Link::Online {
-            let _ = games_played(&self.conn, Some(app_id));
+            if self.local_playing.is_some() {
+                // Report both: the Steam game and the non-Steam one running.
+                self.send_local_playing();
+            } else {
+                let _ = games_played(&self.conn, Some(app_id));
+            }
         } else {
             // Steam won't see this; keep the time here.
             self.unconnected_play.insert(app_id, (unix_now(), self.link == Link::Offline));
@@ -3102,6 +3158,7 @@ impl Online {
         if let Some(app) = self.playing {
             let _ = games_played(&self.conn, Some(app));
         }
+        self.send_local_playing();
         let (conn, sink2) = (self.conn.clone(), sink.clone());
         tokio::spawn(async move {
             let r: Result<CPlayerGetGameBadgeLevelsResponse, _> = conn.call("Player.GetGameBadgeLevels#1", &CPlayerGetGameBadgeLevelsRequest { appid: Some(0) }).await;

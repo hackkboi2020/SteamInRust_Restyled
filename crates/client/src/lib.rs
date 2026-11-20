@@ -86,6 +86,14 @@ pub enum Command {
     CloudSync { app_id: AppId, install_dir: PathBuf, mode: cloud::Mode, keep_local: Vec<String>, keep_cloud: Vec<String>, then_launch: Option<LaunchArgs> },
     /// Close a running game (and the processes it started).
     StopGame { app_id: AppId },
+    /// Tell Steam you're playing a game that isn't on Steam, so friends see
+    /// "Playing <name>" like they do for a Steam shortcut. `game_id` is the
+    /// shortcut-style 64-bit id (see the `localgames` crate); `status` is an
+    /// optional line of rich presence. Sent again after a reconnect; does
+    /// nothing while offline, since Steam can't be told.
+    SetLocalPlaying { game_id: u64, name: String, status: Option<String> },
+    /// The non-Steam game from [`Command::SetLocalPlaying`] was closed.
+    ClearLocalPlaying,
     /// For developers: let a game started by hand (a debugger, a test probe)
     /// use this session's Steam features. Answered with
     /// [`Event::GameAttached`]; nothing is reported to Steam as played.
@@ -310,6 +318,8 @@ impl std::fmt::Debug for Command {
             Command::CloudSettings { steam_root, disabled } => f.debug_struct("CloudSettings").field("steam_root", steam_root).field("disabled", disabled).finish(),
             Command::CloudSync { app_id, install_dir, mode, keep_local, keep_cloud, then_launch } => f.debug_struct("CloudSync").field("app_id", app_id).field("install_dir", install_dir).field("mode", mode).field("keep_local", keep_local).field("keep_cloud", keep_cloud).field("then_launch", then_launch).finish(),
             Command::StopGame { app_id } => f.debug_struct("StopGame").field("app_id", app_id).finish(),
+            Command::SetLocalPlaying { game_id, name, status } => f.debug_struct("SetLocalPlaying").field("game_id", game_id).field("name", name).field("status", status).finish(),
+            Command::ClearLocalPlaying => f.write_str("ClearLocalPlaying"),
             Command::AttachGame { app_id, install_dir } => f.debug_struct("AttachGame").field("app_id", app_id).field("install_dir", install_dir).finish(),
             Command::JoinRunningGame { app_id, friend, connect } => f.debug_struct("JoinRunningGame").field("app_id", app_id).field("friend", friend).field("connect", connect).finish(),
             Command::SendMessage { to, text } => f.debug_struct("SendMessage").field("to", to).field("text", text).finish(),
