@@ -10,6 +10,7 @@ mod gallery;
 pub mod hub;
 mod inventory;
 pub mod library;
+mod local_games;
 mod plugins;
 mod support;
 pub(crate) mod profile;
@@ -24,6 +25,7 @@ pub fn registry(rt: tokio::runtime::Handle, ctx: egui::Context, flags: settings:
     let mut r = Registry::default();
     r.register(store::Store::new(rt.clone(), ctx.clone()));
     r.register(library::Library::new(rt.clone(), ctx.clone(), flags.clone()));
+    r.register(local_games::LocalGames::new(rt.clone(), ctx.clone()));
     r.register(community_home::CommunityHome::default());
     r.register(friends::Friends::default());
     profile::set_runtime(rt.clone());
