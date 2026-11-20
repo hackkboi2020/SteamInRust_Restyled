@@ -1,0 +1,2664 @@
+From 4ce54d2f717fa93aba70075219f2c8030a46f87e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 19 Nov 2026 23:33:52 +0200
+Subject: [PATCH] feat: local games library with art lookup, Steam presence and
+ LAN discovery
+
+Adds a "Local games" page for programs that aren't on Steam:
+- add a program, scan a games folder, import itch.io or Minecraft
+- banner, cover, icon, logo and details fetched from the Steam store and
+  (with an optional key) SteamGridDB, with a manual picker for bad matches
+- Steam-style game page: hero, play bar, About / Notes / LAN / Properties
+- friends see "Playing <name>" via new Command::SetLocalPlaying
+- per-game play time
+- LAN host discovery over UDP, joining by filling in launch options
+
+New crate `localgames`; its std-only modules (id, exe, text, lan) have unit
+tests. See docs/local-games.md.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01HJz2SDJTmTHTjEKb8zHuAB
+---
+ Cargo.toml                              |   1 +
+ apps/desktop/Cargo.toml                 |   1 +
+ apps/desktop/src/builtin/local_games.rs | 959 ++++++++++++++++++++++++
+ apps/desktop/src/builtin/mod.rs         |   2 +
+ crates/client/src/lib.rs                |  10 +
+ crates/client/src/session.rs            |  61 +-
+ crates/localgames/Cargo.toml            |  17 +
+ crates/localgames/src/exe.rs            | 128 ++++
+ crates/localgames/src/fetch.rs          | 373 +++++++++
+ crates/localgames/src/id.rs             |  54 ++
+ crates/localgames/src/lan.rs            | 218 ++++++
+ crates/localgames/src/lib.rs            |  19 +
+ crates/localgames/src/library.rs        | 195 +++++
+ crates/localgames/src/scan.rs           | 149 ++++
+ crates/localgames/src/text.rs           | 178 +++++
+ docs/local-games.md                     |  62 ++
+ 16 files changed, 2425 insertions(+), 2 deletions(-)
+ create mode 100644 apps/desktop/src/builtin/local_games.rs
+ create mode 100644 crates/localgames/Cargo.toml
+ create mode 100644 crates/localgames/src/exe.rs
+ create mode 100644 crates/localgames/src/fetch.rs
+ create mode 100644 crates/localgames/src/id.rs
+ create mode 100644 crates/localgames/src/lan.rs
+ create mode 100644 crates/localgames/src/lib.rs
+ create mode 100644 crates/localgames/src/library.rs
+ create mode 100644 crates/localgames/src/scan.rs
+ create mode 100644 crates/localgames/src/text.rs
+ create mode 100644 docs/local-games.md
+
+diff --git a/Cargo.toml b/Cargo.toml
+index 2b2af58..0a9e03f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -26,6 +26,7 @@ plugins = { path = "crates/plugins" }
+ i18n = { path = "crates/i18n" }
+ depot = { path = "crates/depot" }
+ video = { path = "crates/video" }
++localgames = { path = "crates/localgames" }
+ 
+ # Protocol
+ prost = "0.14"
+diff --git a/apps/desktop/Cargo.toml b/apps/desktop/Cargo.toml
+index 88866e2..324bff4 100644
+--- a/apps/desktop/Cargo.toml
++++ b/apps/desktop/Cargo.toml
+@@ -16,6 +16,7 @@ plugins.workspace = true
+ store.workspace = true
+ video.workspace = true
+ local.workspace = true
++localgames.workspace = true
+ model.workspace = true
+ ui.workspace = true
+ i18n.workspace = true
+diff --git a/apps/desktop/src/builtin/local_games.rs b/apps/desktop/src/builtin/local_games.rs
+new file mode 100644
+index 0000000..e966cdf
+--- /dev/null
++++ b/apps/desktop/src/builtin/local_games.rs
+@@ -0,0 +1,959 @@
++//! Local games: programs that don't come from Steam.
++//!
++//! Add a program, scan a games folder, or import from itch.io or Minecraft.
++//! Each game gets a hero banner, cover, icon, logo and a description fetched
++//! from the internet (and can be changed by hand if the automatic match is
++//! wrong), keeps its own play time, shows up to your Steam friends as
++//! "Playing <name>", and can host or join games on your local network.
++//!
++//! The game's page follows Steam's layout: a hero banner, a play bar, and a
++//! row of feature tabs underneath.
++
++use client::Command;
++use egui::{Align, Align2, Color32, CornerRadius, Layout, Rect, Sense, Ui, pos2, vec2};
++use extensions::{Ctx, Extension, Manifest, PageSpec};
++use localgames::fetch::{ArtKind, ArtOption, Candidate, Fetcher};
++use localgames::library::{Art, LocalGame, Meta, Source, Store, format_playtime};
++use localgames::scan::{self, Found};
++use localgames::{lan, text};
++use std::collections::HashMap;
++use std::process::Command as Proc;
++use std::sync::mpsc::{Receiver, Sender, channel};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++use ui::widgets::EditMenu;
++use ui::{Theme, icons, widgets as w};
++
++/// Work done on other threads, reported back to the page.
++enum Msg {
++    /// Games found by a scan.
++    Found { label: &'static str, list: Vec<Found> },
++    /// Details and art for a game. `lock`: the person chose it by hand.
++    Filled { exe: String, meta: Option<Meta>, art: Art, lock: bool },
++    /// The automatic match wasn't clear; these are the possible games.
++    NeedsPick { exe: String, list: Vec<Candidate> },
++    /// Results of a search the person started.
++    Candidates { exe: String, list: Vec<Candidate> },
++    /// Pictures to choose from.
++    Options { exe: String, kind: ArtKind, list: Vec<ArtOption> },
++    Failed(String),
++}
++
++#[derive(Clone, Copy, PartialEq, Eq, Default)]
++enum Tab {
++    #[default]
++    About,
++    Notes,
++    Lan,
++    Properties,
++}
++
++/// The art finder on a game's Properties tab.
++#[derive(Default)]
++struct Finder {
++    query: String,
++    candidates: Vec<Candidate>,
++    chosen: Option<Candidate>,
++    /// Pictures found, by position in [`ArtKind::ALL`].
++    options: [Vec<ArtOption>; 4],
++    showing: Option<ArtKind>,
++}
++
++struct Running {
++    exe: String,
++    child: std::process::Child,
++    started: Instant,
++    started_unix: u64,
++}
++
++/// LAN discovery state. The socket is only opened once the LAN tab is used,
++/// so people who never use it never see a firewall prompt.
++struct Lan {
++    beacon: Option<lan::Beacon>,
++    error: Option<String>,
++    peers: lan::Peers,
++    instance: u64,
++    hosting: Option<lan::Announce>,
++    last_announce: Option<Instant>,
++    nick: String,
++    last_used: Instant,
++}
++
++impl Lan {
++    fn new() -> Self {
++        Self { beacon: None, error: None, peers: lan::Peers::default(), instance: rand::random(), hosting: None, last_announce: None, nick: String::new(), last_used: Instant::now() }
++    }
++
++    fn ensure(&mut self) {
++        self.last_used = Instant::now();
++        if self.beacon.is_none() && self.error.is_none() {
++            match lan::Beacon::bind() {
++                Ok(b) => self.beacon = Some(b),
++                Err(e) => self.error = Some(format!("Couldn't listen on the network (port {}): {e}", lan::PORT)),
++            }
++        }
++    }
++
++    fn tick(&mut self) {
++        let now = Instant::now();
++        // Not hosting and the tab hasn't been open for a while: let go of the socket.
++        if self.hosting.is_none() && self.beacon.is_some() && now.duration_since(self.last_used) > Duration::from_secs(15) {
++            self.beacon = None;
++            self.peers = lan::Peers::default();
++            return;
++        }
++        if let Some(b) = &self.beacon {
++            b.poll(self.instance, &mut self.peers, now);
++            self.peers.prune(now);
++            if let Some(a) = &self.hosting {
++                if self.last_announce.is_none_or(|t| now.duration_since(t) >= lan::INTERVAL) {
++                    let _ = b.announce(a);
++                    self.last_announce = Some(now);
++                }
++            }
++        }
++    }
++}
++
++pub struct LocalGames {
++    rt: tokio::runtime::Handle,
++    egui: egui::Context,
++    store: Store,
++    tx: Sender<Msg>,
++    rx: Receiver<Msg>,
++    /// The open game, by its program path.
++    selected: Option<String>,
++    tab: Tab,
++    filter: String,
++    running: Option<Running>,
++    finder: Finder,
++    /// Automatic matches that need the person to choose, by program path.
++    pending: HashMap<String, Vec<Candidate>>,
++    busy: bool,
++    last_failure: Option<Instant>,
++    lan: Lan,
++}
++
++impl LocalGames {
++    pub fn new(rt: tokio::runtime::Handle, egui: egui::Context) -> Self {
++        let (tx, rx) = channel();
++        Self {
++            rt,
++            egui,
++            store: Store::default(),
++            tx,
++            rx,
++            selected: None,
++            tab: Tab::About,
++            filter: String::new(),
++            running: None,
++            finder: Finder::default(),
++            pending: HashMap::new(),
++            busy: false,
++            last_failure: None,
++            lan: Lan::new(),
++        }
++    }
++
++    fn index_of(&self, exe: &str) -> Option<usize> {
++        self.store.games.iter().position(|g| g.exe == exe)
++    }
++
++    fn select(&mut self, exe: String) {
++        let name = self.index_of(&exe).map(|i| self.store.games[i].name.clone()).unwrap_or_default();
++        self.finder = Finder { query: name, candidates: self.pending.remove(&exe).unwrap_or_default(), ..Default::default() };
++        self.tab = Tab::About;
++        self.selected = Some(exe);
++    }
++
++    // ---- background work ----
++
++    fn send_later<F>(&self, work: F)
++    where
++        F: std::future::Future<Output = Msg> + Send + 'static,
++    {
++        let (tx, egui) = (self.tx.clone(), self.egui.clone());
++        self.rt.spawn(async move {
++            let _ = tx.send(work.await);
++            egui.request_repaint();
++        });
++    }
++
++    /// Find a game on the internet and fill in its art and details. A clear
++    /// match is applied; an unclear one is left for the person to choose.
++    fn lookup(&self, exe: String, name: String) {
++        let key = self.store.sgdb_key.clone();
++        self.send_later(async move {
++            let fetcher = match Fetcher::new(&key) {
++                Ok(f) => f,
++                Err(e) => return Msg::Failed(e.to_string()),
++            };
++            match fetcher.search(&name).await {
++                Err(e) => Msg::Failed(format!("Couldn't look up {name}: {e}")),
++                Ok(list) => {
++                    let titles: Vec<&str> = list.iter().map(|c| c.title.as_str()).collect();
++                    match text::best_match(&name, &titles) {
++                        Some(i) => {
++                            let (meta, art) = fetcher.fill(&list[i]).await;
++                            Msg::Filled { exe, meta, art, lock: false }
++                        }
++                        None => Msg::NeedsPick { exe, list },
++                    }
++                }
++            }
++        });
++    }
++
++    fn search(&self, exe: String, query: String) {
++        let key = self.store.sgdb_key.clone();
++        self.send_later(async move {
++            match Fetcher::new(&key) {
++                Err(e) => Msg::Failed(e.to_string()),
++                Ok(f) => match f.search(&query).await {
++                    Ok(list) => Msg::Candidates { exe, list },
++                    Err(e) => Msg::Failed(format!("Search failed: {e}")),
++                },
++            }
++        });
++    }
++
++    fn use_candidate(&self, exe: String, c: Candidate) {
++        let key = self.store.sgdb_key.clone();
++        self.send_later(async move {
++            match Fetcher::new(&key) {
++                Err(e) => Msg::Failed(e.to_string()),
++                Ok(f) => {
++                    let (meta, art) = f.fill(&c).await;
++                    Msg::Filled { exe, meta, art, lock: true }
++                }
++            }
++        });
++    }
++
++    fn load_options(&self, exe: String, c: Candidate, kind: ArtKind) {
++        let key = self.store.sgdb_key.clone();
++        self.send_later(async move {
++            match Fetcher::new(&key) {
++                Err(e) => Msg::Failed(e.to_string()),
++                Ok(f) => {
++                    let mut c = c;
++                    if c.sgdb_id.is_none() {
++                        c.sgdb_id = f.sgdb_for(&c.title).await;
++                    }
++                    Msg::Options { exe, kind, list: f.art_options(&c, kind).await }
++                }
++            }
++        });
++    }
++
++    fn scan(&mut self, label: &'static str, job: impl FnOnce() -> Vec<Found> + Send + 'static) {
++        self.busy = true;
++        let (tx, egui) = (self.tx.clone(), self.egui.clone());
++        self.rt.spawn_blocking(move || {
++            let _ = tx.send(Msg::Found { label, list: job() });
++            egui.request_repaint();
++        });
++    }
++
++    /// Add what a scan found, skipping what's already here, and look each new
++    /// game up. Returns how many were added.
++    fn add_found(&mut self, list: Vec<Found>) -> usize {
++        let now = unix_now();
++        let mut added = 0;
++        for f in list {
++            let exe = f.exe.display().to_string();
++            let mut g = LocalGame::new(f.name.clone(), exe.clone(), f.source, now);
++            g.art.cover = f.cover_url;
++            if self.store.add(g).is_ok() {
++                added += 1;
++                self.lookup(exe, f.name);
++            }
++        }
++        added
++    }
++
++    fn handle(&mut self, msg: Msg, ctx: &mut Ctx) {
++        match msg {
++            Msg::Found { label, list } => {
++                self.busy = false;
++                let found = list.len();
++                let added = self.add_found(list);
++                ctx.toast(match (found, added) {
++                    (0, _) => format!("No {label} games found"),
++                    (_, 0) => format!("Everything from {label} is already in your library"),
++                    (_, n) => format!("Added {n} game{} from {label}", if n == 1 { "" } else { "s" }),
++                });
++            }
++            Msg::Filled { exe, meta, art, lock } => {
++                if let Some(i) = self.index_of(&exe) {
++                    let g = &mut self.store.games[i];
++                    // A hand-picked look is only replaced by another hand-pick.
++                    if lock || !g.art_locked {
++                        for (slot, new) in [(&mut g.art.hero, art.hero), (&mut g.art.cover, art.cover), (&mut g.art.icon, art.icon), (&mut g.art.logo, art.logo)] {
++                            if new.is_some() {
++                                *slot = new;
++                            }
++                        }
++                        if let Some(m) = meta.filter(|m| !m.is_empty()) {
++                            g.meta = m;
++                        }
++                        g.art_locked |= lock;
++                    }
++                }
++            }
++            Msg::NeedsPick { exe, list } => {
++                if self.selected.as_deref() == Some(exe.as_str()) {
++                    self.finder.candidates = list;
++                } else {
++                    self.pending.insert(exe, list);
++                }
++            }
++            Msg::Candidates { exe, list } => {
++                if self.selected.as_deref() == Some(exe.as_str()) {
++                    if list.is_empty() {
++                        ctx.toast("Nothing found. Try a shorter name.");
++                    }
++                    self.finder.candidates = list;
++                }
++            }
++            Msg::Options { exe, kind, list } => {
++                if self.selected.as_deref() == Some(exe.as_str()) {
++                    if list.is_empty() {
++                        ctx.toast(format!("No {} pictures found", kind.label().to_lowercase()));
++                    }
++                    self.finder.options[kind_index(kind)] = list;
++                    self.finder.showing = Some(kind);
++                }
++            }
++            Msg::Failed(e) => {
++                // Offline, every lookup fails: say so once, not once per game.
++                if self.last_failure.is_none_or(|t| t.elapsed() > Duration::from_secs(20)) {
++                    self.last_failure = Some(Instant::now());
++                    ctx.toast(format!("{e} (art and details can be fetched later)"));
++                }
++            }
++        }
++    }
++
++    // ---- playing ----
++
++    fn launch(&mut self, i: usize, extra_args: Option<String>, ctx: &mut Ctx) {
++        if let Some(r) = &self.running {
++            let name = self.index_of(&r.exe).map(|i| self.store.games[i].name.clone()).unwrap_or_default();
++            ctx.toast(format!("{name} is already running"));
++            return;
++        }
++        let g = self.store.games[i].clone();
++        let exe = std::path::PathBuf::from(&g.exe);
++        if !exe.is_file() {
++            ctx.toast(format!("{} was not found at {}", g.name, g.exe));
++            return;
++        }
++        let mut cmd = Proc::new(&exe);
++        cmd.args(text::split_args(&g.args));
++        if let Some(extra) = extra_args {
++            cmd.args(text::split_args(&extra));
++        }
++        if let Some(dir) = exe.parent() {
++            cmd.current_dir(dir);
++        }
++        match cmd.spawn() {
++            Ok(child) => {
++                self.running = Some(Running { exe: g.exe.clone(), child, started: Instant::now(), started_unix: unix_now() });
++                // Friends see "Playing <name>".
++                ctx.send(Command::SetLocalPlaying { game_id: g.game_id(), name: g.name.clone(), status: Some(g.status.clone()).filter(|s| !s.trim().is_empty()) });
++            }
++            Err(e) => ctx.toast(format!("Couldn't start {}: {e}", g.name)),
++        }
++    }
++
++    fn finish(&mut self, ctx: &mut Ctx) {
++        let Some(r) = self.running.take() else { return };
++        let secs = r.started.elapsed().as_secs();
++        if let Some(i) = self.index_of(&r.exe) {
++            self.store.record_session(i, r.started_unix, secs);
++            ctx.toast(format!("Played {} for {}", self.store.games[i].name, format_playtime(secs)));
++        }
++        ctx.send(Command::ClearLocalPlaying);
++    }
++
++    // ---- pages ----
++
++    fn library(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx) {
++        ui.label(w::text_bold("Local games", 28.0, t.text));
++        ui.label(w::text("Games that aren't on Steam: add them once, play them here, and your friends still see what you're playing.", 14.0, t.text_dim));
++        ui.add_space(14.0);
++        ui.horizontal_wrapped(|ui| {
++            if w::button(ui, t, Some(icons::PLUS), "Add program", w::Kind::Primary, w::Size::Md).clicked() {
++                if let Some(path) = rfd::FileDialog::new().add_filter("Programs", &["exe", "bat", "cmd"]).pick_file() {
++                    let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
++                    let folder = path.parent().and_then(|p| p.file_name()).map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
++                    // "Game.exe" in a folder called "My Game" is called "My Game".
++                    let name = if text::normalize(&folder).len() >= 3 && !text::normalize(&stem).is_empty() && text::normalize(&folder).contains(&text::normalize(&stem)) { text::display_name(&folder) } else { text::display_name(&stem) };
++                    let found = Found { name, exe: path, source: Source::Manual, cover_url: None };
++                    let n = self.add_found(vec![found]);
++                    if n == 0 {
++                        ctx.toast("That program is already in your library");
++                    }
++                }
++            }
++            if w::button(ui, t, Some(icons::FOLDER), "Scan folder…", w::Kind::Secondary, w::Size::Md).clicked() {
++                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
++                    self.store.games_folder = dir.display().to_string();
++                    self.scan("folder", move || scan::scan_folder(&dir));
++                }
++            }
++            if !self.store.games_folder.is_empty() && w::button(ui, t, Some(icons::DOWNLOAD), "Rescan", w::Kind::Ghost, w::Size::Md).clicked() {
++                let dir = std::path::PathBuf::from(self.store.games_folder.clone());
++                self.scan("folder", move || scan::scan_folder(&dir));
++            }
++            if w::button(ui, t, Some(icons::DOWNLOAD), "Import from itch.io", w::Kind::Secondary, w::Size::Md).clicked() {
++                self.scan("itch.io", scan::scan_itch);
++            }
++            if w::button(ui, t, Some(icons::DOWNLOAD), "Import Minecraft", w::Kind::Secondary, w::Size::Md).clicked() {
++                self.scan("Minecraft", scan::scan_minecraft);
++            }
++            if self.busy {
++                ui.add(egui::Spinner::new());
++            }
++        });
++        ui.add_space(10.0);
++        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter your games").desired_width(280.0).margin(vec2(10.0, 8.0))).with_edit_menu();
++        ui.add_space(18.0);
++
++        if self.store.games.is_empty() {
++            w::card(t).show(ui, |ui| {
++                ui.set_width(ui.available_width());
++                ui.label(w::text_semibold("Your library is empty", 16.0, t.text));
++                ui.label(w::text("Add a program, scan the folder you keep your games in, or import your itch.io and Minecraft games. Covers and descriptions are fetched automatically.", 13.5, t.text_dim));
++            });
++            return;
++        }
++
++        let want = text::normalize(&self.filter);
++        let mut order: Vec<usize> = (0..self.store.games.len()).filter(|&i| want.is_empty() || text::normalize(&self.store.games[i].name).contains(&want)).collect();
++        order.sort_by_key(|&i| self.store.games[i].name.to_lowercase());
++        let mut open = None;
++        ui.horizontal_wrapped(|ui| {
++            ui.spacing_mut().item_spacing = vec2(16.0, 16.0);
++            for i in order {
++                let g = &self.store.games[i];
++                let playing = self.running.as_ref().is_some_and(|r| r.exe == g.exe);
++                if tile(ui, t, g, playing) {
++                    open = Some(g.exe.clone());
++                }
++            }
++        });
++        if let Some(exe) = open {
++            self.select(exe);
++        }
++    }
++
++    fn detail(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, i: usize) {
++        let g = self.store.games[i].clone();
++        let running_this = self.running.as_ref().is_some_and(|r| r.exe == g.exe);
++        let mut back = false;
++        let mut play = false;
++        let mut stop = false;
++
++        if w::button(ui, t, None, "‹ Local games", w::Kind::Ghost, w::Size::Sm).clicked() {
++            back = true;
++        }
++        ui.add_space(10.0);
++
++        // Hero banner with the logo (or name) on a dark strip.
++        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 280.0), Sense::hover());
++        let r = t.corner();
++        let urls: Vec<&str> = [g.art.hero.as_deref(), g.art.cover.as_deref()].into_iter().flatten().collect();
++        if !w::paint_cover_first(ui, rect, &urls, r) {
++            ui.painter().rect_filled(rect, r, t.surface);
++        }
++        let strip = Rect::from_min_max(pos2(rect.left(), rect.bottom() - 92.0), rect.max);
++        ui.painter().rect_filled(strip, CornerRadius { nw: 0, ne: 0, sw: r.sw, se: r.se }, Color32::from_black_alpha(150));
++        let logo = Rect::from_min_size(pos2(strip.left() + 24.0, strip.top() + 14.0), vec2(280.0, 64.0));
++        if !g.art.logo.as_deref().is_some_and(|u| w::paint_cover(ui, logo, u, CornerRadius::ZERO)) {
++            ui.painter().text(pos2(strip.left() + 24.0, strip.center().y), Align2::LEFT_CENTER, &g.name, w::font_bold(30.0), Color32::WHITE);
++        }
++
++        // Play bar.
++        ui.add_space(14.0);
++        ui.horizontal(|ui| {
++            if running_this {
++                if w::button(ui, t, Some(icons::X), "Stop", w::Kind::Danger, w::Size::Lg).clicked() {
++                    stop = true;
++                }
++            } else if w::button(ui, t, Some(icons::PLAY), "Play", w::Kind::Play, w::Size::Lg).clicked() {
++                play = true;
++            }
++            ui.add_space(16.0);
++            stat(ui, t, "PLAY TIME", &format_playtime(g.playtime_secs));
++            stat(ui, t, "LAST PLAYED", &g.last_played.map(|l| ago(unix_now(), l)).unwrap_or_else(|| "Never".into()));
++            if running_this {
++                stat(ui, t, "STATUS", "Playing now — friends can see it");
++            }
++            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
++                w::pill(ui, source_label(g.source), t.text_dim, t.raised);
++            });
++        });
++
++        // Feature bar.
++        ui.add_space(18.0);
++        ui.horizontal(|ui| {
++            for (tab, icon, label) in [(Tab::About, icons::INFO, "About"), (Tab::Notes, icons::NOTE, "Notes"), (Tab::Lan, icons::USERS, "LAN play"), (Tab::Properties, icons::GEAR, "Properties")] {
++                let kind = if self.tab == tab { w::Kind::Primary } else { w::Kind::Ghost };
++                if w::button(ui, t, Some(icon), label, kind, w::Size::Sm).clicked() {
++                    self.tab = tab;
++                }
++            }
++        });
++        ui.add_space(12.0);
++        match self.tab {
++            Tab::About => self.tab_about(ui, t, i),
++            Tab::Notes => self.tab_notes(ui, t, i),
++            Tab::Lan => self.tab_lan(ui, t, ctx, i),
++            Tab::Properties => self.tab_properties(ui, t, ctx, i),
++        }
++
++        if play {
++            self.launch(i, None, ctx);
++        }
++        if stop {
++            if let Some(r) = &mut self.running {
++                let _ = r.child.kill();
++            }
++        }
++        if back {
++            self.selected = None;
++        }
++    }
++
++    fn tab_about(&mut self, ui: &mut Ui, t: &Theme, i: usize) {
++        let g = self.store.games[i].clone();
++        w::card(t).show(ui, |ui| {
++            ui.set_width(ui.available_width());
++            if g.meta.is_empty() {
++                ui.label(w::text("No details yet. They're fetched from the internet when you're online.", 13.5, t.text_dim));
++                if self.finder.candidates.len() > 1 || self.pending.contains_key(&g.exe) {
++                    ui.label(w::text("The automatic match wasn't certain. Pick the right game under Properties.", 13.5, t.text));
++                }
++                if w::button(ui, t, Some(icons::SEARCH), "Find details & art", w::Kind::Secondary, w::Size::Sm).clicked() {
++                    self.tab = Tab::Properties;
++                }
++                return;
++            }
++            if !g.meta.description.is_empty() {
++                ui.label(w::text(&g.meta.description, 14.5, t.text));
++                ui.add_space(10.0);
++            }
++            for (label, value) in [
++                ("Developer", g.meta.developers.join(", ")),
++                ("Publisher", g.meta.publishers.join(", ")),
++                ("Released", g.meta.release_date.clone()),
++                ("Genres", g.meta.genres.join(", ")),
++            ] {
++                if !value.is_empty() {
++                    ui.horizontal(|ui| {
++                        ui.add_sized([100.0, 18.0], egui::Label::new(w::text_medium(label, 13.0, t.text_faint)));
++                        ui.label(w::text(value, 13.5, t.text));
++                    });
++                }
++            }
++            if !g.meta.features.is_empty() {
++                ui.add_space(8.0);
++                ui.horizontal_wrapped(|ui| {
++                    for f in &g.meta.features {
++                        w::pill(ui, f, t.text_dim, t.raised);
++                    }
++                });
++            }
++            if !g.meta.website.is_empty() {
++                ui.add_space(8.0);
++                if ui.link(g.meta.website.as_str()).clicked() {
++                    let _ = open::that(&g.meta.website);
++                }
++            }
++        });
++    }
++
++    fn tab_notes(&mut self, ui: &mut Ui, t: &Theme, i: usize) {
++        w::card(t).show(ui, |ui| {
++            ui.set_width(ui.available_width());
++            ui.label(w::text("Your notes for this game: saves, builds, where you stopped.", 13.0, t.text_dim));
++            ui.add(egui::TextEdit::multiline(&mut self.store.games[i].notes).desired_rows(10).desired_width(f32::INFINITY).margin(vec2(10.0, 8.0))).with_edit_menu();
++        });
++    }
++
++    fn tab_lan(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, i: usize) {
++        self.lan.ensure();
++        if self.lan.nick.is_empty() {
++            self.lan.nick = ctx.state.persona_name.clone();
++        }
++        let g = self.store.games[i].clone();
++        let mut join: Option<(std::net::IpAddr, u16)> = None;
++        w::card(t).show(ui, |ui| {
++            ui.set_width(ui.available_width());
++            ui.label(w::text_semibold("Play on your local network", 16.0, t.text));
++            ui.label(w::text("Finds friends on the same Wi-Fi or cable. The game's own multiplayer does the playing; this finds who is hosting and starts your game pointed at them. Windows may ask to allow network access the first time.", 13.0, t.text_dim));
++            if let Some(e) = &self.lan.error {
++                ui.colored_label(Color32::from_rgb(230, 90, 90), e.as_str());
++                return;
++            }
++            ui.add_space(10.0);
++            ui.horizontal(|ui| {
++                ui.label(w::text_medium("Your name on the network", 13.0, t.text_dim));
++                ui.add(egui::TextEdit::singleline(&mut self.lan.nick).desired_width(180.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++            });
++            ui.add_space(6.0);
++            ui.label(w::text_semibold("Host", 14.0, t.text));
++            ui.horizontal(|ui| {
++                ui.label(w::text("Game port", 13.0, t.text_dim));
++                let mut port = if g.host_port == 0 { 25565 } else { g.host_port };
++                if ui.add(egui::DragValue::new(&mut port).range(1..=65535)).changed() {
++                    self.store.games[i].host_port = port;
++                }
++                let hosting_this = self.lan.hosting.as_ref().is_some_and(|a| a.game == g.name);
++                if hosting_this {
++                    if w::button(ui, t, Some(icons::X), "Stop hosting", w::Kind::Danger, w::Size::Sm).clicked() {
++                        self.lan.hosting = None;
++                    }
++                    ui.label(w::text("Announcing to your network", 13.0, t.text_dim));
++                } else if w::button(ui, t, Some(icons::USERS), "Host this game", w::Kind::Secondary, w::Size::Sm).clicked() {
++                    self.lan.hosting = Some(lan::Announce { instance: self.lan.instance, nick: self.lan.nick.clone(), game: g.name.clone(), port, players: 1, max_players: 0 });
++                    self.lan.last_announce = None;
++                }
++            });
++            ui.add_space(8.0);
++            ui.label(w::text_semibold("Join", 14.0, t.text));
++            ui.horizontal(|ui| {
++                ui.label(w::text("Launch options to join", 13.0, t.text_dim));
++                ui.add(egui::TextEdit::singleline(&mut self.store.games[i].join_args).hint_text("--connect {ip}:{port}").desired_width(280.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++            });
++            ui.label(w::text("{ip} and {port} are filled in from the host you pick. Check the game's manual for its connect option.", 12.0, t.text_faint));
++            ui.add_space(8.0);
++
++            let now = Instant::now();
++            let want = text::normalize(&g.name);
++            let rows: Vec<(std::net::IpAddr, lan::Announce)> = self.lan.peers.live(now).into_iter().map(|h| (h.ip, h.announce.clone())).collect();
++            let (mine, others): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(_, a)| text::normalize(&a.game) == want);
++            if mine.is_empty() {
++                ui.label(w::text(format!("Nobody on your network is hosting {} right now.", g.name), 13.5, t.text_dim));
++            }
++            for (ip, a) in &mine {
++                ui.horizontal(|ui| {
++                    ui.label(w::text_medium(&a.nick, 14.0, t.text));
++                    ui.label(w::text(format!("{ip}:{}", a.port), 13.0, t.text_faint));
++                    if w::button(ui, t, Some(icons::PLAY), "Join", w::Kind::Primary, w::Size::Sm).clicked() {
++                        join = Some((*ip, a.port));
++                    }
++                });
++            }
++            if !others.is_empty() {
++                ui.add_space(8.0);
++                w::caption(ui, t, "Other games on your network");
++                for (ip, a) in &others {
++                    ui.label(w::text(format!("{} — {} ({ip}:{})", a.nick, a.game, a.port), 13.0, t.text_dim));
++                }
++            }
++        });
++        if let Some((ip, port)) = join {
++            if g.join_args.trim().is_empty() {
++                ctx.toast("Set the launch options to join first, e.g. --connect {ip}:{port}");
++            } else {
++                self.launch(i, Some(lan::fill_template(&g.join_args, ip, port)), ctx);
++            }
++        }
++    }
++
++    fn tab_properties(&mut self, ui: &mut Ui, t: &Theme, ctx: &mut Ctx, i: usize) {
++        let g = self.store.games[i].clone();
++        let running_this = self.running.as_ref().is_some_and(|r| r.exe == g.exe);
++        let mut remove = false;
++        let mut look_again = false;
++        let mut chosen: Option<Candidate> = None;
++        let mut search = false;
++        let mut browse: Option<ArtKind> = None;
++        let mut set_art: Option<(ArtKind, String)> = None;
++        let mut status_changed = false;
++
++        w::card(t).show(ui, |ui| {
++            ui.set_width(ui.available_width());
++            ui.label(w::text_semibold("Game", 16.0, t.text));
++            field(ui, t, "Name", |ui| {
++                // The name is part of the game's id, so it stays put while playing.
++                ui.add_enabled(!running_this, egui::TextEdit::singleline(&mut self.store.games[i].name).desired_width(360.0).margin(vec2(10.0, 6.0)));
++            });
++            field(ui, t, "Program", |ui| {
++                ui.label(w::text(&g.exe, 13.0, t.text_faint).monospace());
++            });
++            field(ui, t, "Launch options", |ui| {
++                ui.add(egui::TextEdit::singleline(&mut self.store.games[i].args).hint_text("-windowed").desired_width(360.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++            });
++            field(ui, t, "Status for friends", |ui| {
++                let r = ui.add(egui::TextEdit::singleline(&mut self.store.games[i].status).hint_text("e.g. Speedrunning").desired_width(360.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++                status_changed = r.lost_focus() && running_this;
++            });
++            ui.horizontal(|ui| {
++                if let Some(dir) = std::path::Path::new(&g.exe).parent() {
++                    if w::button(ui, t, Some(icons::FOLDER), "Browse local files", w::Kind::Secondary, w::Size::Sm).clicked() {
++                        local::open_folder(dir);
++                    }
++                }
++                if ui.add_enabled_ui(!running_this, |ui| w::button(ui, t, Some(icons::TRASH), "Remove from library", w::Kind::Danger, w::Size::Sm)).inner.clicked() {
++                    remove = true;
++                }
++            });
++        });
++        ui.add_space(12.0);
++
++        w::card(t).show(ui, |ui| {
++            ui.set_width(ui.available_width());
++            ui.label(w::text_semibold("Art & details", 16.0, t.text));
++            ui.label(w::text(if g.art_locked { "You chose this look by hand, so it won't change on its own." } else { "Picked automatically. If it's the wrong game, search and choose the right one." }, 13.0, t.text_dim));
++            ui.add_space(8.0);
++            ui.horizontal(|ui| {
++                ui.add(egui::TextEdit::singleline(&mut self.finder.query).hint_text("Game title").desired_width(300.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++                if w::button(ui, t, Some(icons::SEARCH), "Search", w::Kind::Primary, w::Size::Sm).clicked() {
++                    search = true;
++                }
++                if g.art_locked && w::button(ui, t, None, "Match automatically again", w::Kind::Ghost, w::Size::Sm).clicked() {
++                    look_again = true;
++                }
++            });
++            for c in self.finder.candidates.iter().take(8) {
++                ui.horizontal(|ui| {
++                    let (thumb, _) = ui.allocate_exact_size(vec2(80.0, 30.0), Sense::hover());
++                    if !c.thumb.as_deref().is_some_and(|u| w::paint_cover(ui, thumb, u, t.corner_small())) {
++                        ui.painter().rect_filled(thumb, t.corner_small(), t.raised);
++                    }
++                    ui.label(w::text_medium(&c.title, 14.0, t.text));
++                    ui.label(w::text(if c.steam_app_id.is_some() { "Steam store" } else { "SteamGridDB" }, 12.0, t.text_faint));
++                    if w::button(ui, t, Some(icons::CHECK), "Use this", w::Kind::Secondary, w::Size::Sm).clicked() {
++                        chosen = Some(c.clone());
++                    }
++                });
++            }
++            ui.add_space(10.0);
++            ui.label(w::text_semibold("Pictures", 14.0, t.text));
++            if self.store.sgdb_key.trim().is_empty() {
++                ui.label(w::text("Add a free SteamGridDB key in Settings to choose from many more community pictures.", 12.5, t.text_faint));
++            }
++            for kind in ArtKind::ALL {
++                ui.horizontal(|ui| {
++                    let current = match kind {
++                        ArtKind::Hero => &g.art.hero,
++                        ArtKind::Cover => &g.art.cover,
++                        ArtKind::Icon => &g.art.icon,
++                        ArtKind::Logo => &g.art.logo,
++                    };
++                    let size = thumb_size(kind);
++                    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
++                    if !current.as_deref().is_some_and(|u| w::paint_cover(ui, rect, u, t.corner_small())) {
++                        ui.painter().rect_filled(rect, t.corner_small(), t.raised);
++                    }
++                    ui.label(w::text_medium(kind.label(), 14.0, t.text));
++                    if w::button(ui, t, Some(icons::IMAGE), "Choose…", w::Kind::Secondary, w::Size::Sm).clicked() {
++                        browse = Some(kind);
++                    }
++                });
++                if self.finder.showing == Some(kind) {
++                    ui.horizontal_wrapped(|ui| {
++                        for o in &self.finder.options[kind_index(kind)] {
++                            let size = thumb_size(kind);
++                            let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
++                            if !w::paint_cover(ui, rect, &o.thumb, t.corner_small()) {
++                                w::skeleton(ui, t, rect, t.corner_small());
++                            }
++                            if resp.on_hover_text(o.source).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
++                                set_art = Some((kind, o.url.clone()));
++                            }
++                        }
++                    });
++                }
++            }
++        });
++
++        // Apply what was clicked, now that nothing is borrowed.
++        if status_changed {
++            if let Some(i) = self.running.as_ref().and_then(|r| self.index_of(&r.exe)) {
++                let g = &self.store.games[i];
++                ctx.send(Command::SetLocalPlaying { game_id: g.game_id(), name: g.name.clone(), status: Some(g.status.clone()).filter(|s| !s.trim().is_empty()) });
++            }
++        }
++        if search && !self.finder.query.trim().is_empty() {
++            self.search(g.exe.clone(), self.finder.query.trim().to_string());
++        }
++        if let Some(c) = chosen {
++            self.finder.chosen = Some(c.clone());
++            self.finder.options = Default::default();
++            self.finder.showing = None;
++            self.use_candidate(g.exe.clone(), c);
++            ctx.toast("Fetching details and art…");
++        }
++        if look_again {
++            self.store.games[i].art_locked = false;
++            self.lookup(g.exe.clone(), g.name.clone());
++        }
++        if let Some(kind) = browse {
++            let c = self.finder.chosen.clone().unwrap_or(Candidate { title: g.name.clone(), steam_app_id: g.meta.steam_app_id, sgdb_id: None, thumb: None });
++            self.load_options(g.exe.clone(), c, kind);
++        }
++        if let Some((kind, url)) = set_art {
++            let game = &mut self.store.games[i];
++            match kind {
++                ArtKind::Hero => game.art.hero = Some(url),
++                ArtKind::Cover => game.art.cover = Some(url),
++                ArtKind::Icon => game.art.icon = Some(url),
++                ArtKind::Logo => game.art.logo = Some(url),
++            }
++            game.art_locked = true;
++        }
++        if remove {
++            self.store.games.remove(i);
++            self.selected = None;
++        }
++    }
++}
++
++impl Extension for LocalGames {
++    fn manifest(&self) -> Manifest {
++        Manifest { id: "localgames", name: "Local games", author: "SteamInRust", description: "Games that aren't on Steam: library, art, play time, friends' presence and LAN play", ..Manifest::DEFAULT }
++    }
++
++    fn pages(&self) -> Vec<PageSpec> {
++        vec![PageSpec::new("localgames", "Local games", icons::FOLDER).main().order(25)]
++    }
++
++    fn page(&mut self, _page: &str, ui: &mut Ui, ctx: &mut Ctx) {
++        let t = ctx.theme.clone();
++        egui::ScrollArea::vertical().id_salt("local-games").auto_shrink([false, false]).show(ui, |ui| {
++            w::centered(ui, 1400.0, 28.0, |ui| {
++                ui.add_space(24.0);
++                let open = self.selected.as_deref().and_then(|e| self.index_of(e));
++                match open {
++                    Some(i) => self.detail(ui, &t, ctx, i),
++                    None => {
++                        self.selected = None;
++                        self.library(ui, &t, ctx);
++                    }
++                }
++                ui.add_space(40.0);
++            });
++        });
++    }
++
++    fn settings(&mut self, ui: &mut Ui, ctx: &mut Ctx) -> bool {
++        let t = ctx.theme.clone();
++        ui.label(w::text("A free SteamGridDB key (steamgriddb.com, under Preferences > API) lets you pick from many more banners, covers, icons and logos. It stays on this PC and is only sent to SteamGridDB.", 13.0, t.text_dim));
++        field(ui, &t, "SteamGridDB key", |ui| {
++            ui.add(egui::TextEdit::singleline(&mut self.store.sgdb_key).password(true).desired_width(320.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++        });
++        field(ui, &t, "Games folder", |ui| {
++            ui.add(egui::TextEdit::singleline(&mut self.store.games_folder).hint_text("D:\\Games").desired_width(320.0).margin(vec2(10.0, 6.0))).with_edit_menu();
++        });
++        true
++    }
++
++    fn tick(&mut self, ctx: &mut Ctx) {
++        while let Ok(msg) = self.rx.try_recv() {
++            self.handle(msg, ctx);
++        }
++        let exited = match &mut self.running {
++            Some(r) => !matches!(r.child.try_wait(), Ok(None)),
++            None => false,
++        };
++        if exited {
++            self.finish(ctx);
++        } else if self.running.is_some() {
++            // Wake up now and then to notice the game closing.
++            self.egui.request_repaint_after(Duration::from_secs(2));
++        }
++        self.lan.tick();
++        if self.lan.beacon.is_some() {
++            self.egui.request_repaint_after(Duration::from_secs(1));
++        }
++    }
++
++    fn save(&self) -> Option<String> {
++        self.store.to_json()
++    }
++
++    fn load(&mut self, data: &str) {
++        self.store = Store::from_json(data);
++    }
++}
++
++// ---- small helpers ----
++
++fn unix_now() -> u64 {
++    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
++}
++
++fn ago(now: u64, then: u64) -> String {
++    match now.saturating_sub(then) {
++        0..=59 => "Just now".into(),
++        s @ 60..=3599 => format!("{} min ago", s / 60),
++        s @ 3600..=86399 => format!("{} h ago", s / 3600),
++        s => format!("{} days ago", s / 86400),
++    }
++}
++
++fn source_label(s: Source) -> &'static str {
++    match s {
++        Source::Manual => "Local game",
++        Source::Folder => "From a games folder",
++        Source::Itch => "itch.io",
++        Source::Minecraft => "Minecraft",
++    }
++}
++
++fn kind_index(kind: ArtKind) -> usize {
++    ArtKind::ALL.iter().position(|k| *k == kind).unwrap_or(0)
++}
++
++fn thumb_size(kind: ArtKind) -> egui::Vec2 {
++    match kind {
++        ArtKind::Hero => vec2(176.0, 56.0),
++        ArtKind::Cover => vec2(84.0, 126.0),
++        ArtKind::Icon => vec2(48.0, 48.0),
++        ArtKind::Logo => vec2(140.0, 48.0),
++    }
++}
++
++fn stat(ui: &mut Ui, t: &Theme, label: &str, value: &str) {
++    ui.vertical(|ui| {
++        ui.label(w::text_medium(label, 10.5, t.text_faint));
++        ui.label(w::text_semibold(value, 14.0, t.text));
++    });
++    ui.add_space(14.0);
++}
++
++/// A labelled row in a card.
++fn field(ui: &mut Ui, t: &Theme, label: &str, add: impl FnOnce(&mut Ui)) {
++    ui.horizontal(|ui| {
++        ui.add_sized([150.0, 20.0], egui::Label::new(w::text_medium(label, 13.0, t.text_dim)));
++        add(ui);
++    });
++}
++
++/// One game in the grid: its cover with the name and play time under it.
++/// True when clicked.
++fn tile(ui: &mut Ui, t: &Theme, g: &LocalGame, playing: bool) -> bool {
++    let (rect, resp) = ui.allocate_exact_size(vec2(168.0, 300.0), Sense::click());
++    let img = Rect::from_min_size(rect.min, vec2(rect.width(), 252.0));
++    let r = t.corner();
++    let urls: Vec<&str> = [g.art.cover.as_deref(), g.art.hero.as_deref(), g.art.icon.as_deref()].into_iter().flatten().collect();
++    if !w::paint_cover_first(ui, img, &urls, r) {
++        ui.painter().rect_filled(img, r, t.surface);
++        let initial = g.name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
++        ui.painter().text(img.center(), Align2::CENTER_CENTER, initial, w::font_medium(44.0), t.text_faint);
++    }
++    if resp.hovered() {
++        ui.painter().rect_stroke(img, r, egui::Stroke::new(2.0, t.accent), egui::StrokeKind::Inside);
++    }
++    if playing {
++        ui.painter().text(img.left_top() + vec2(8.0, 8.0), Align2::LEFT_TOP, "● Playing", w::font_semibold(12.0), Color32::WHITE);
++    }
++    let p = ui.painter();
++    p.text(rect.left_top() + vec2(2.0, 260.0), Align2::LEFT_TOP, &g.name, w::font_medium(13.5), t.text);
++    p.text(rect.left_top() + vec2(2.0, 280.0), Align2::LEFT_TOP, format_playtime(g.playtime_secs), w::font(12.0), t.text_faint);
++    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
++}
+diff --git a/apps/desktop/src/builtin/mod.rs b/apps/desktop/src/builtin/mod.rs
+index 1435b34..81b3e22 100644
+--- a/apps/desktop/src/builtin/mod.rs
++++ b/apps/desktop/src/builtin/mod.rs
+@@ -8,6 +8,7 @@ mod downloads;
+ pub mod hub;
+ mod inventory;
+ pub mod library;
++mod local_games;
+ mod plugins;
+ mod support;
+ mod profile;
+@@ -22,6 +23,7 @@ pub fn registry(rt: tokio::runtime::Handle, ctx: egui::Context, flags: settings:
+     let mut r = Registry::default();
+     r.register(store::Store::new(rt.clone(), ctx.clone()));
+     r.register(library::Library::new(rt.clone(), ctx.clone(), flags.clone()));
++    r.register(local_games::LocalGames::new(rt.clone(), ctx.clone()));
+     r.register(community::Community::default());
+     r.register(profile::Profile::default());
+     r.register(downloads::Downloads::new(flags.clone()));
+diff --git a/crates/client/src/lib.rs b/crates/client/src/lib.rs
+index 4ef314a..476aa75 100644
+--- a/crates/client/src/lib.rs
++++ b/crates/client/src/lib.rs
+@@ -85,6 +85,14 @@ pub enum Command {
+     CloudSync { app_id: AppId, install_dir: PathBuf, mode: cloud::Mode, keep_local: Vec<String>, keep_cloud: Vec<String>, then_launch: Option<LaunchArgs> },
+     /// Close a running game (and the processes it started).
+     StopGame { app_id: AppId },
++    /// Tell Steam you're playing a game that isn't on Steam, so friends see
++    /// "Playing <name>" like they do for a Steam shortcut. `game_id` is the
++    /// shortcut-style 64-bit id (see the `localgames` crate); `status` is an
++    /// optional line of rich presence. Sent again after a reconnect; does
++    /// nothing while offline, since Steam can't be told.
++    SetLocalPlaying { game_id: u64, name: String, status: Option<String> },
++    /// The non-Steam game from [`Command::SetLocalPlaying`] was closed.
++    ClearLocalPlaying,
+     /// For developers: let a game started by hand (a debugger, a test probe)
+     /// use this session's Steam features. Answered with
+     /// [`Event::GameAttached`]; nothing is reported to Steam as played.
+@@ -303,6 +311,8 @@ impl std::fmt::Debug for Command {
+             Command::CloudSettings { steam_root, disabled } => f.debug_struct("CloudSettings").field("steam_root", steam_root).field("disabled", disabled).finish(),
+             Command::CloudSync { app_id, install_dir, mode, keep_local, keep_cloud, then_launch } => f.debug_struct("CloudSync").field("app_id", app_id).field("install_dir", install_dir).field("mode", mode).field("keep_local", keep_local).field("keep_cloud", keep_cloud).field("then_launch", then_launch).finish(),
+             Command::StopGame { app_id } => f.debug_struct("StopGame").field("app_id", app_id).finish(),
++            Command::SetLocalPlaying { game_id, name, status } => f.debug_struct("SetLocalPlaying").field("game_id", game_id).field("name", name).field("status", status).finish(),
++            Command::ClearLocalPlaying => f.write_str("ClearLocalPlaying"),
+             Command::AttachGame { app_id, install_dir } => f.debug_struct("AttachGame").field("app_id", app_id).field("install_dir", install_dir).finish(),
+             Command::JoinRunningGame { app_id, friend, connect } => f.debug_struct("JoinRunningGame").field("app_id", app_id).field("friend", friend).field("connect", connect).finish(),
+             Command::SendMessage { to, text } => f.debug_struct("SendMessage").field("to", to).field("text", text).finish(),
+diff --git a/crates/client/src/session.rs b/crates/client/src/session.rs
+index 7b0d1be..df10940 100644
+--- a/crates/client/src/session.rs
++++ b/crates/client/src/session.rs
+@@ -310,6 +310,9 @@ struct Online {
+     personas: HashMap<SteamId, Persona>,
+     apps: HashMap<AppId, OwnedApp>,
+     playing: Option<AppId>,
++    /// A non-Steam game we're "playing": its shortcut-style game id, name and
++    /// rich presence line. Kept so a reconnect can tell Steam again.
++    local_playing: Option<(u64, String, Option<String>)>,
+     /// Process ids of games we started.
+     running: HashMap<AppId, u32>,
+     cell_id: u32,
+@@ -455,6 +458,7 @@ async fn online(
+         personas: HashMap::new(),
+         apps: HashMap::new(),
+         playing: None,
++        local_playing: None,
+         running: HashMap::new(),
+         cell_id: info.cell_id,
+         download_cell: None,
+@@ -628,6 +632,18 @@ async fn online(
+                     st.persona_state = s;
+                     let _ = set_persona(&conn, s);
+                 }
++                Some(Command::SetLocalPlaying { game_id, name, status }) => {
++                    st.local_playing = Some((game_id, name, status));
++                    if st.link == Link::Online {
++                        st.send_local_playing();
++                    }
++                }
++                Some(Command::ClearLocalPlaying) => {
++                    if st.local_playing.take().is_some() && st.link == Link::Online {
++                        // Don't clear a real Steam game we're also running.
++                        let _ = games_played(&conn, st.playing);
++                    }
++                }
+                 Some(Command::JoinRunningGame { app_id, friend, connect }) => {
+                     let lobby = lobby_of(&connect);
+                     st.ipc.push(app_id, crate::ipc::protocol::GameEvent::JoinRequested { lobby, friend, connect });
+@@ -1337,7 +1353,12 @@ async fn online(
+                 }
+                 if st.playing == Some(app_id) {
+                     st.playing = None;
+-                    let _ = games_played(&conn, None);
++                    if st.local_playing.is_some() {
++                        // A non-Steam game is still running: keep showing it.
++                        st.send_local_playing();
++                    } else {
++                        let _ = games_played(&conn, None);
++                    }
+                 }
+                 sink(Event::GameStopped { app_id });
+             }
+@@ -1469,6 +1490,24 @@ fn games_played(conn: &Connection, app: Option<AppId>) -> Result<(), Error> {
+     Ok(())
+ }
+ 
++/// Like [`games_played`] for a game that isn't on Steam: the game id is the
++/// shortcut-style one and the name goes in `game_extra_info`, which is what
++/// Steam's own client sends for a shortcut so friends see "Playing <name>".
++/// A Steam game we're also running stays in the list.
++fn games_played_local(conn: &Connection, steam_app: Option<AppId>, game_id: u64, name: &str) -> Result<(), Error> {
++    let mut list: Vec<c_msg_client_games_played::GamePlayed> = steam_app
++        .map(|id| c_msg_client_games_played::GamePlayed { game_id: Some(id as u64), ..Default::default() })
++        .into_iter()
++        .collect();
++    list.push(c_msg_client_games_played::GamePlayed {
++        game_id: Some(game_id),
++        game_extra_info: Some(name.to_string()),
++        ..Default::default()
++    });
++    conn.send(CLIENT_GAMES_PLAYED_WITH_DATA_BLOB, &CMsgClientGamesPlayed { games_played: list, client_os_type: Some(OS_TYPE_WIN11), ..Default::default() })?;
++    Ok(())
++}
++
+ fn is_individual(id: SteamId) -> bool {
+     (id >> 52) & 0xF == 1
+ }
+@@ -1478,6 +1517,18 @@ fn hex(bytes: &[u8]) -> String {
+ }
+ 
+ impl Online {
++    /// Tell Steam about the non-Steam game we're playing, if any, with its
++    /// rich presence line (best effort: Steam shows the game's name for sure;
++    /// whether a custom status line is displayed for non-Steam games is up to
++    /// the friend's client).
++    fn send_local_playing(&self) {
++        let Some((game_id, name, status)) = &self.local_playing else { return };
++        let _ = games_played_local(&self.conn, self.playing, *game_id, name);
++        if let Some(text) = status.as_ref().filter(|s| !s.trim().is_empty()) {
++            crate::ipc::rich_presence(&self.conn, &[("status".to_string(), text.clone())]);
++        }
++    }
++
+     /// Returns `Some` when the server ends the session.
+     fn handle(
+         &mut self,
+@@ -2600,7 +2651,12 @@ impl Online {
+         self.launched_dirs.insert(app_id, dir.to_path_buf());
+         self.playing = Some(app_id);
+         if self.link == Link::Online {
+-            let _ = games_played(&self.conn, Some(app_id));
++            if self.local_playing.is_some() {
++                // Report both: the Steam game and the non-Steam one running.
++                self.send_local_playing();
++            } else {
++                let _ = games_played(&self.conn, Some(app_id));
++            }
+         } else {
+             // Steam won't see this; keep the time here.
+             self.unconnected_play.insert(app_id, (unix_now(), self.link == Link::Offline));
+@@ -3057,6 +3113,7 @@ impl Online {
+         if let Some(app) = self.playing {
+             let _ = games_played(&self.conn, Some(app));
+         }
++        self.send_local_playing();
+         let (conn, sink2) = (self.conn.clone(), sink.clone());
+         tokio::spawn(async move {
+             let r: Result<CPlayerGetGameBadgeLevelsResponse, _> = conn.call("Player.GetGameBadgeLevels#1", &CPlayerGetGameBadgeLevelsRequest { appid: Some(0) }).await;
+diff --git a/crates/localgames/Cargo.toml b/crates/localgames/Cargo.toml
+new file mode 100644
+index 0000000..969236c
+--- /dev/null
++++ b/crates/localgames/Cargo.toml
+@@ -0,0 +1,17 @@
++[package]
++name = "localgames"
++description = "Local (non-Steam) game library: scanning, art and metadata lookup, LAN discovery"
++version.workspace = true
++edition.workspace = true
++license.workspace = true
++
++[dependencies]
++reqwest.workspace = true
++serde.workspace = true
++serde_json.workspace = true
++flate2.workspace = true
++thiserror.workspace = true
++tracing.workspace = true
++
++[dev-dependencies]
++tokio.workspace = true
+diff --git a/crates/localgames/src/exe.rs b/crates/localgames/src/exe.rs
+new file mode 100644
+index 0000000..0e28940
+--- /dev/null
++++ b/crates/localgames/src/exe.rs
+@@ -0,0 +1,128 @@
++//! Finding a game's main program inside its folder.
++//!
++//! Game folders hold many `.exe` files: the game, an uninstaller, crash
++//! reporters, redistributable installers. [`pick_main`] guesses which one the
++//! person means to launch.
++
++use crate::text::normalize;
++use std::cmp::Reverse;
++use std::path::{Path, PathBuf};
++
++/// Programs that are never the game itself.
++const NOISE: &[&str] = &[
++    "unins", "uninstall", "setup", "install", "crash", "redist", "vcredist", "vc_redist", "dxsetup", "dotnet", "directx", "oalinst",
++    "helper", "notification", "updater", "webhelper", "cefprocess", "werfault", "unitycrash", "diagnostic", "eac_", "easyanticheat",
++];
++
++pub fn is_noise(file_name: &str) -> bool {
++    let l = file_name.to_ascii_lowercase();
++    NOISE.iter().any(|n| l.contains(n))
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Candidate {
++    pub path: PathBuf,
++    pub size: u64,
++}
++
++/// The most likely main program: one whose name matches the folder's wins,
++/// then the one closest to the top of the folder, then the biggest.
++pub fn pick_main<'a>(folder_name: &str, candidates: &'a [Candidate]) -> Option<&'a Candidate> {
++    let want = normalize(folder_name);
++    candidates
++        .iter()
++        .filter(|c| c.path.file_name().and_then(|n| n.to_str()).is_some_and(|n| !is_noise(n)))
++        .max_by_key(|c| {
++            let stem = c.path.file_stem().and_then(|s| s.to_str()).map(normalize).unwrap_or_default();
++            let name_match = stem.len() >= 3 && !want.is_empty() && (stem == want || want.contains(&stem) || stem.contains(&want));
++            (name_match, Reverse(c.path.components().count()), c.size)
++        })
++}
++
++/// Every `.exe` under `root`, up to `max_depth` folders down (0 = only
++/// `root`). Symlinks are not followed, and the result is capped.
++pub fn find_exes(root: &Path, max_depth: usize) -> Vec<Candidate> {
++    const CAP: usize = 500;
++    let mut out = Vec::new();
++    let mut stack = vec![(root.to_path_buf(), 0usize)];
++    while let Some((dir, depth)) = stack.pop() {
++        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
++        for entry in entries.flatten() {
++            if out.len() >= CAP {
++                return out;
++            }
++            let Ok(kind) = entry.file_type() else { continue };
++            let path = entry.path();
++            if kind.is_dir() {
++                if depth < max_depth {
++                    stack.push((path, depth + 1));
++                }
++            } else if kind.is_file() && path.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
++                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
++                out.push(Candidate { path, size });
++            }
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn c(p: &str, size: u64) -> Candidate {
++        Candidate { path: PathBuf::from(p), size }
++    }
++
++    #[test]
++    fn noise_is_recognised() {
++        assert!(is_noise("unins000.exe"));
++        assert!(is_noise("UnityCrashHandler64.exe"));
++        assert!(is_noise("vc_redist.x64.exe"));
++        assert!(!is_noise("Hades.exe"));
++    }
++
++    #[test]
++    fn a_program_named_like_the_folder_wins_over_a_bigger_one() {
++        let list = [c("G/Hades/Support.exe", 9_000), c("G/Hades/Hades.exe", 100)];
++        assert_eq!(pick_main("Hades", &list).unwrap().path, PathBuf::from("G/Hades/Hades.exe"));
++    }
++
++    #[test]
++    fn noise_never_wins_even_if_it_is_the_only_big_file() {
++        let list = [c("G/Game/unins000.exe", 90_000), c("G/Game/run.exe", 10)];
++        assert_eq!(pick_main("Something", &list).unwrap().path, PathBuf::from("G/Game/run.exe"));
++    }
++
++    #[test]
++    fn without_a_name_match_the_shallowest_then_biggest_is_chosen() {
++        let list = [c("G/Game/bin/deep.exe", 5_000), c("G/Game/top.exe", 10), c("G/Game/top2.exe", 20)];
++        assert_eq!(pick_main("Unrelated", &list).unwrap().path, PathBuf::from("G/Game/top2.exe"));
++    }
++
++    #[test]
++    fn only_noise_means_no_guess() {
++        assert!(pick_main("Game", &[c("G/Game/unins000.exe", 1)]).is_none());
++        assert!(pick_main("Game", &[]).is_none());
++    }
++
++    #[test]
++    fn find_exes_respects_depth_and_extension() {
++        let root = std::env::temp_dir().join(format!("sir-exe-test-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&root);
++        std::fs::create_dir_all(root.join("a/b/c")).unwrap();
++        std::fs::write(root.join("top.EXE"), b"x").unwrap();
++        std::fs::write(root.join("a/readme.txt"), b"x").unwrap();
++        std::fs::write(root.join("a/b/mid.exe"), b"x").unwrap();
++        std::fs::write(root.join("a/b/c/deep.exe"), b"x").unwrap();
++        let names = |depth| {
++            let mut v: Vec<String> = find_exes(&root, depth).iter().map(|c| c.path.file_name().unwrap().to_string_lossy().to_string()).collect();
++            v.sort();
++            v
++        };
++        assert_eq!(names(0), ["top.EXE"]);
++        assert_eq!(names(2), ["mid.exe", "top.EXE"]);
++        assert_eq!(names(3), ["deep.exe", "mid.exe", "top.EXE"]);
++        let _ = std::fs::remove_dir_all(&root);
++    }
++}
+diff --git a/crates/localgames/src/fetch.rs b/crates/localgames/src/fetch.rs
+new file mode 100644
+index 0000000..09f9582
+--- /dev/null
++++ b/crates/localgames/src/fetch.rs
+@@ -0,0 +1,373 @@
++//! Looking up a game on the internet: its description and details, and
++//! pictures to choose from.
++//!
++//! Two sources:
++//! - Steam's public store (no account or key): search, details, and the
++//!   official art every store page has.
++//! - SteamGridDB (needs a free API key the person adds in settings): lots of
++//!   community-made heroes, covers, icons and logos, and the only place most
++//!   indie or itch.io games have any.
++//!
++//! Nothing here is required to play: with no internet every call fails with
++//! an error and the library keeps what it has.
++
++use crate::library::{Art, Meta};
++use crate::text::strip_html;
++use serde_json::Value;
++use std::time::Duration;
++
++#[derive(Debug, thiserror::Error)]
++pub enum Error {
++    #[error("network: {0}")]
++    Http(#[from] reqwest::Error),
++    #[error("unexpected reply from {0}")]
++    Shape(&'static str),
++}
++
++pub type Result<T> = std::result::Result<T, Error>;
++
++const STEAM_CDN: &str = "https://cdn.akamai.steamstatic.com/steam/apps";
++const SGDB: &str = "https://www.steamgriddb.com/api/v2";
++
++/// A game that might be the one the person means.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Candidate {
++    pub title: String,
++    pub steam_app_id: Option<u32>,
++    pub sgdb_id: Option<u64>,
++    /// Small picture for the list.
++    pub thumb: Option<String>,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum ArtKind {
++    Hero,
++    Cover,
++    Icon,
++    Logo,
++}
++
++impl ArtKind {
++    pub const ALL: [ArtKind; 4] = [ArtKind::Hero, ArtKind::Cover, ArtKind::Icon, ArtKind::Logo];
++
++    pub fn label(self) -> &'static str {
++        match self {
++            ArtKind::Hero => "Hero",
++            ArtKind::Cover => "Cover",
++            ArtKind::Icon => "Icon",
++            ArtKind::Logo => "Logo",
++        }
++    }
++
++    fn sgdb_path(self) -> &'static str {
++        match self {
++            ArtKind::Hero => "heroes",
++            ArtKind::Cover => "grids",
++            ArtKind::Icon => "icons",
++            ArtKind::Logo => "logos",
++        }
++    }
++}
++
++/// One picture the person can choose.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ArtOption {
++    pub url: String,
++    pub thumb: String,
++    pub source: &'static str,
++}
++
++#[derive(Clone)]
++pub struct Fetcher {
++    http: reqwest::Client,
++    sgdb_key: Option<String>,
++}
++
++impl Fetcher {
++    pub fn new(sgdb_key: &str) -> Result<Self> {
++        let http = reqwest::Client::builder()
++            .user_agent(concat!("SteamInRust/", env!("CARGO_PKG_VERSION")))
++            .timeout(Duration::from_secs(15))
++            .build()?;
++        let key = sgdb_key.trim();
++        Ok(Self { http, sgdb_key: (!key.is_empty()).then(|| key.to_string()) })
++    }
++
++    /// Games matching `query`, Steam's store first, then SteamGridDB's.
++    /// A source that fails is skipped; it is an error only if both do.
++    pub async fn search(&self, query: &str) -> Result<Vec<Candidate>> {
++        let steam = self.steam_search(query).await;
++        let grid = match &self.sgdb_key {
++            Some(_) => self.sgdb_search(query).await,
++            None => Ok(Vec::new()),
++        };
++        match (steam, grid) {
++            (Err(e), Err(_)) => Err(e),
++            (steam, grid) => {
++                let mut out = steam.unwrap_or_default();
++                for c in grid.unwrap_or_default() {
++                    if !out.iter().any(|o| crate::text::normalize(&o.title) == crate::text::normalize(&c.title)) {
++                        out.push(c);
++                    }
++                }
++                Ok(out)
++            }
++        }
++    }
++
++    async fn steam_search(&self, query: &str) -> Result<Vec<Candidate>> {
++        let v: Value = self
++            .http
++            .get("https://store.steampowered.com/api/storesearch/")
++            .query(&[("term", query), ("cc", "us"), ("l", "english")])
++            .send()
++            .await?
++            .error_for_status()?
++            .json()
++            .await?;
++        parse_steam_search(&v).ok_or(Error::Shape("Steam store search"))
++    }
++
++    async fn sgdb_search(&self, query: &str) -> Result<Vec<Candidate>> {
++        let v = self.sgdb_get(&format!("{SGDB}/search/autocomplete/{}", encode_path(query))).await?;
++        parse_sgdb_search(&v).ok_or(Error::Shape("SteamGridDB search"))
++    }
++
++    async fn sgdb_get(&self, url: &str) -> Result<Value> {
++        let key = self.sgdb_key.as_deref().unwrap_or_default();
++        Ok(self.http.get(url).bearer_auth(key).send().await?.error_for_status()?.json().await?)
++    }
++
++    /// Description, developer, genres and so on from Steam's store page.
++    pub async fn metadata(&self, steam_app_id: u32) -> Result<Meta> {
++        let v: Value = self
++            .http
++            .get("https://store.steampowered.com/api/appdetails")
++            .query(&[("appids", steam_app_id.to_string()), ("l", "english".into())])
++            .send()
++            .await?
++            .error_for_status()?
++            .json()
++            .await?;
++        parse_app_details(&v, steam_app_id).ok_or(Error::Shape("Steam app details"))
++    }
++
++    /// Does this address answer? Steam moved some games' art to new
++    /// addresses, so an official picture is only offered if it is really there.
++    async fn reachable(&self, url: &str) -> bool {
++        self.http.head(url).send().await.is_ok_and(|r| r.status().is_success())
++    }
++
++    /// Everything useful about a chosen game in one go: its details and the
++    /// first picture of each kind.
++    pub async fn fill(&self, c: &Candidate) -> (Option<Meta>, Art) {
++        let mut c = c.clone();
++        if c.sgdb_id.is_none() {
++            c.sgdb_id = self.sgdb_for(&c.title).await;
++        }
++        let meta = match c.steam_app_id {
++            Some(id) => self.metadata(id).await.ok(),
++            None => None,
++        };
++        let mut art = Art::default();
++        for kind in ArtKind::ALL {
++            let first = self.art_options(&c, kind).await.into_iter().next().map(|o| o.url);
++            match kind {
++                ArtKind::Hero => art.hero = first,
++                ArtKind::Cover => art.cover = first,
++                ArtKind::Icon => art.icon = first,
++                ArtKind::Logo => art.logo = first,
++            }
++        }
++        (meta, art)
++    }
++
++    /// Pictures of one kind for a game, official ones first.
++    pub async fn art_options(&self, c: &Candidate, kind: ArtKind) -> Vec<ArtOption> {
++        let mut out = Vec::new();
++        if let Some(official) = c.steam_app_id.and_then(|id| steam_art(id, kind)) {
++            if self.reachable(&official.url).await {
++                out.push(official);
++            }
++        }
++        if let (Some(_), Some(gid)) = (&self.sgdb_key, c.sgdb_id) {
++            if let Ok(v) = self.sgdb_get(&format!("{SGDB}/{}/game/{gid}", kind.sgdb_path())).await {
++                out.extend(parse_sgdb_art(&v));
++            }
++        }
++        out
++    }
++
++    /// SteamGridDB's own id for a game we only know from Steam (so its art
++    /// can be offered too). `None` without a key or when not found.
++    pub async fn sgdb_for(&self, title: &str) -> Option<u64> {
++        self.sgdb_key.as_ref()?;
++        self.sgdb_search(title).await.ok()?.into_iter().find(|c| crate::text::normalize(&c.title) == crate::text::normalize(title))?.sgdb_id
++    }
++}
++
++/// The official pictures every Steam store page has.
++pub fn steam_art(app_id: u32, kind: ArtKind) -> Option<ArtOption> {
++    let file = match kind {
++        ArtKind::Hero => "library_hero.jpg",
++        ArtKind::Cover => "library_600x900.jpg",
++        ArtKind::Logo => "logo.png",
++        // The store has no square icon; the header is the closest official one.
++        ArtKind::Icon => return None,
++    };
++    let url = format!("{STEAM_CDN}/{app_id}/{file}");
++    Some(ArtOption { thumb: url.clone(), url, source: "Steam" })
++}
++
++/// Percent-encode a path segment (a game title in a URL).
++fn encode_path(s: &str) -> String {
++    let mut out = String::new();
++    for b in s.bytes() {
++        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
++            out.push(b as char);
++        } else {
++            out.push_str(&format!("%{b:02X}"));
++        }
++    }
++    out
++}
++
++fn parse_steam_search(v: &Value) -> Option<Vec<Candidate>> {
++    let items = v.get("items")?.as_array()?;
++    Some(
++        items
++            .iter()
++            .filter(|i| i.get("type").and_then(Value::as_str).is_none_or(|t| t == "app"))
++            .filter_map(|i| {
++                let id = u32::try_from(i.get("id")?.as_u64()?).ok()?;
++                Some(Candidate {
++                    title: i.get("name")?.as_str()?.to_string(),
++                    steam_app_id: Some(id),
++                    sgdb_id: None,
++                    thumb: i.get("tiny_image").and_then(Value::as_str).map(String::from),
++                })
++            })
++            .take(10)
++            .collect(),
++    )
++}
++
++fn parse_sgdb_search(v: &Value) -> Option<Vec<Candidate>> {
++    if v.get("success")?.as_bool()? != true {
++        return None;
++    }
++    Some(
++        v.get("data")?
++            .as_array()?
++            .iter()
++            .filter_map(|g| Some(Candidate { title: g.get("name")?.as_str()?.to_string(), steam_app_id: None, sgdb_id: g.get("id")?.as_u64(), thumb: None }))
++            .take(10)
++            .collect(),
++    )
++}
++
++fn parse_sgdb_art(v: &Value) -> Vec<ArtOption> {
++    v.get("data")
++        .and_then(Value::as_array)
++        .map(|list| {
++            list.iter()
++                .filter_map(|a| {
++                    let url = a.get("url")?.as_str()?;
++                    let thumb = a.get("thumb").and_then(Value::as_str).unwrap_or(url);
++                    // https only: never fetch pictures over plain http.
++                    (url.starts_with("https://")).then(|| ArtOption { url: url.to_string(), thumb: thumb.to_string(), source: "SteamGridDB" })
++                })
++                .take(24)
++                .collect()
++        })
++        .unwrap_or_default()
++}
++
++fn parse_app_details(v: &Value, app_id: u32) -> Option<Meta> {
++    let entry = v.get(app_id.to_string())?;
++    if entry.get("success")?.as_bool()? != true {
++        return None;
++    }
++    let d = entry.get("data")?;
++    let strings = |key: &str| -> Vec<String> { d.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default() };
++    let described = |key: &str| -> Vec<String> {
++        d.get(key).and_then(Value::as_array).map(|a| a.iter().filter_map(|g| g.get("description")?.as_str().map(String::from)).collect()).unwrap_or_default()
++    };
++    Some(Meta {
++        description: strip_html(d.get("short_description").and_then(Value::as_str).unwrap_or_default()),
++        developers: strings("developers"),
++        publishers: strings("publishers"),
++        release_date: d.get("release_date").and_then(|r| r.get("date")).and_then(Value::as_str).unwrap_or_default().to_string(),
++        genres: described("genres"),
++        features: described("categories"),
++        website: d.get("website").and_then(Value::as_str).filter(|w| w.starts_with("https://") || w.starts_with("http://")).unwrap_or_default().to_string(),
++        steam_app_id: Some(app_id),
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn steam_search_results_are_read() {
++        let v = json!({"total": 2, "items": [
++            {"type": "app", "name": "Hades", "id": 1145360, "tiny_image": "https://x/t.jpg"},
++            {"type": "sub", "name": "Hades Bundle", "id": 5}
++        ]});
++        let found = parse_steam_search(&v).unwrap();
++        assert_eq!(found.len(), 1);
++        assert_eq!(found[0].title, "Hades");
++        assert_eq!(found[0].steam_app_id, Some(1145360));
++        assert!(parse_steam_search(&json!({"nope": 1})).is_none());
++    }
++
++    #[test]
++    fn app_details_are_read_and_cleaned() {
++        let v = json!({"1145360": {"success": true, "data": {
++            "short_description": "Defy the god of the dead &amp; <b>escape</b>.",
++            "developers": ["Supergiant Games"], "publishers": ["Supergiant Games"],
++            "release_date": {"coming_soon": false, "date": "17 Sep, 2020"},
++            "genres": [{"id": "1", "description": "Action"}],
++            "categories": [{"id": 2, "description": "Single-player"}],
++            "website": "https://www.supergiantgames.com/"
++        }}});
++        let m = parse_app_details(&v, 1145360).unwrap();
++        assert_eq!(m.description, "Defy the god of the dead & escape.");
++        assert_eq!(m.developers, ["Supergiant Games"]);
++        assert_eq!(m.genres, ["Action"]);
++        assert_eq!(m.features, ["Single-player"]);
++        assert_eq!(m.steam_app_id, Some(1145360));
++    }
++
++    #[test]
++    fn a_failed_details_reply_is_not_data() {
++        assert!(parse_app_details(&json!({"9": {"success": false}}), 9).is_none());
++        assert!(parse_app_details(&json!({}), 9).is_none());
++    }
++
++    #[test]
++    fn sgdb_art_keeps_only_https_pictures() {
++        let v = json!({"success": true, "data": [
++            {"id": 1, "url": "https://cdn2.steamgriddb.com/a.png", "thumb": "https://cdn2.steamgriddb.com/t.png"},
++            {"id": 2, "url": "http://insecure/a.png"},
++            {"id": 3}
++        ]});
++        let art = parse_sgdb_art(&v);
++        assert_eq!(art.len(), 1);
++        assert_eq!(art[0].source, "SteamGridDB");
++    }
++
++    #[test]
++    fn titles_are_encoded_for_the_url_path() {
++        assert_eq!(encode_path("Dead Cells"), "Dead%20Cells");
++        assert_eq!(encode_path("a/b?c"), "a%2Fb%3Fc");
++    }
++
++    #[test]
++    fn official_steam_art_has_no_icon() {
++        assert!(steam_art(10, ArtKind::Icon).is_none());
++        assert!(steam_art(10, ArtKind::Hero).unwrap().url.ends_with("/10/library_hero.jpg"));
++    }
++}
+diff --git a/crates/localgames/src/id.rs b/crates/localgames/src/id.rs
+new file mode 100644
+index 0000000..ba1a183
+--- /dev/null
++++ b/crates/localgames/src/id.rs
+@@ -0,0 +1,54 @@
++//! The id Steam gives a non-Steam game, so friends see the same game whether
++//! it was added here or as a shortcut in Steam.
++//!
++//! Steam builds it from a CRC-32 of the quoted program path followed by the
++//! display name, with the top bit set; the full 64-bit game id has that value
++//! in its high half and `0x02000000` (the "shortcut" type) in the low half.
++
++/// CRC-32 (IEEE 802.3, the one zlib and Steam use).
++pub fn crc32(data: &[u8]) -> u32 {
++    let mut crc = !0u32;
++    for &b in data {
++        crc ^= b as u32;
++        for _ in 0..8 {
++            let mask = (crc & 1).wrapping_neg();
++            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
++        }
++    }
++    !crc
++}
++
++/// The 32-bit "app id" of a shortcut.
++pub fn shortcut_app_id(exe: &str, name: &str) -> u32 {
++    crc32(format!("\"{exe}\"{name}").as_bytes()) | 0x8000_0000
++}
++
++/// The 64-bit game id sent to Steam when this game is running.
++pub fn game_id(exe: &str, name: &str) -> u64 {
++    ((shortcut_app_id(exe, name) as u64) << 32) | 0x0200_0000
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn crc32_matches_the_standard_check_value() {
++        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
++        assert_eq!(crc32(b""), 0);
++    }
++
++    #[test]
++    fn shortcut_ids_have_the_shortcut_shape() {
++        let id = game_id(r"C:\Games\Hades\Hades.exe", "Hades");
++        assert_eq!(id & 0xFFFF_FFFF, 0x0200_0000);
++        assert!(id >> 63 == 1, "top bit must be set");
++        assert_eq!(shortcut_app_id("a", "b") >> 31, 1);
++    }
++
++    #[test]
++    fn same_input_same_id_different_input_different_id() {
++        assert_eq!(game_id("x.exe", "X"), game_id("x.exe", "X"));
++        assert_ne!(game_id("x.exe", "X"), game_id("x.exe", "Y"));
++    }
++}
+diff --git a/crates/localgames/src/lan.rs b/crates/localgames/src/lan.rs
+new file mode 100644
+index 0000000..7504df9
+--- /dev/null
++++ b/crates/localgames/src/lan.rs
+@@ -0,0 +1,218 @@
++//! LAN discovery: find who on the same network is hosting a game.
++//!
++//! Hosts broadcast a small announcement over UDP every few seconds; everyone
++//! listens and keeps a list of hosts seen recently. This only finds people.
++//! The game's own networking does the actual playing, so joining means
++//! starting the game with the host's address filled into the launch options
++//! (see [`fill_template`]).
++//!
++//! Everything received is untrusted input from the network: packets are size
++//! limited, text is stripped of control characters and truncated, and the
++//! table of known hosts has a fixed maximum size.
++
++use std::collections::HashMap;
++use std::io;
++use std::net::{IpAddr, UdpSocket};
++use std::time::{Duration, Instant};
++
++pub const PORT: u16 = 47620;
++const MAGIC: &str = "SIRLAN1";
++const MAX_PACKET: usize = 512;
++const MAX_TEXT: usize = 48;
++const MAX_HOSTS: usize = 256;
++
++/// How long a host stays listed without a new announcement.
++pub const TTL: Duration = Duration::from_secs(10);
++/// How often a host should announce itself.
++pub const INTERVAL: Duration = Duration::from_secs(3);
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Announce {
++    /// Random per run, so our own broadcasts can be ignored.
++    pub instance: u64,
++    /// Who is hosting.
++    pub nick: String,
++    /// The game being hosted.
++    pub game: String,
++    /// The game's own port, for joining.
++    pub port: u16,
++    pub players: u8,
++    pub max_players: u8,
++}
++
++/// No control characters (tabs and newlines would break the format), at most
++/// [`MAX_TEXT`] characters, no surrounding spaces.
++fn clean(s: &str) -> String {
++    s.chars().filter(|c| !c.is_control()).take(MAX_TEXT).collect::<String>().trim().to_string()
++}
++
++pub fn encode(a: &Announce) -> String {
++    format!("{MAGIC}\t{:x}\t{}\t{}\t{}\t{}\t{}", a.instance, clean(&a.nick), clean(&a.game), a.port, a.players, a.max_players)
++}
++
++/// `None` for anything that isn't a well-formed announcement.
++pub fn decode(text: &str) -> Option<Announce> {
++    let mut parts = text.split('\t');
++    if parts.next()? != MAGIC {
++        return None;
++    }
++    let instance = u64::from_str_radix(parts.next()?, 16).ok()?;
++    let nick = clean(parts.next()?);
++    let game = clean(parts.next()?);
++    let port: u16 = parts.next()?.parse().ok()?;
++    let players: u8 = parts.next()?.parse().ok()?;
++    let max_players: u8 = parts.next()?.parse().ok()?;
++    if parts.next().is_some() || port == 0 || game.is_empty() {
++        return None;
++    }
++    Some(Announce { instance, nick, game, port, players, max_players })
++}
++
++#[derive(Debug, Clone)]
++pub struct Host {
++    pub ip: IpAddr,
++    pub announce: Announce,
++    pub seen: Instant,
++}
++
++/// Hosts heard recently.
++#[derive(Default)]
++pub struct Peers {
++    hosts: HashMap<(IpAddr, u64), Host>,
++}
++
++impl Peers {
++    pub fn update(&mut self, ip: IpAddr, announce: Announce, now: Instant) {
++        let key = (ip, announce.instance);
++        if !self.hosts.contains_key(&key) && self.hosts.len() >= MAX_HOSTS {
++            self.prune(now);
++            if self.hosts.len() >= MAX_HOSTS {
++                return; // a flood of fake hosts must not grow memory
++            }
++        }
++        self.hosts.insert(key, Host { ip, announce, seen: now });
++    }
++
++    pub fn prune(&mut self, now: Instant) {
++        self.hosts.retain(|_, h| now.saturating_duration_since(h.seen) <= TTL);
++    }
++
++    /// Hosts still fresh, sorted by game then host name.
++    pub fn live(&self, now: Instant) -> Vec<&Host> {
++        let mut v: Vec<&Host> = self.hosts.values().filter(|h| now.saturating_duration_since(h.seen) <= TTL).collect();
++        v.sort_by(|a, b| (&a.announce.game, &a.announce.nick, a.ip).cmp(&(&b.announce.game, &b.announce.nick, b.ip)));
++        v
++    }
++}
++
++/// Launch options for joining: `{ip}` and `{port}` are replaced. Only these
++/// two values (an address parsed from the packet's source and a number) are
++/// ever inserted; text from the network is never put on a command line.
++pub fn fill_template(template: &str, ip: IpAddr, port: u16) -> String {
++    template.replace("{ip}", &ip.to_string()).replace("{port}", &port.to_string())
++}
++
++/// A UDP socket that sends and receives announcements.
++pub struct Beacon {
++    sock: UdpSocket,
++}
++
++impl Beacon {
++    pub fn bind() -> io::Result<Self> {
++        let sock = UdpSocket::bind(("0.0.0.0", PORT))?;
++        sock.set_broadcast(true)?;
++        sock.set_nonblocking(true)?;
++        Ok(Self { sock })
++    }
++
++    pub fn announce(&self, a: &Announce) -> io::Result<()> {
++        self.sock.send_to(encode(a).as_bytes(), ("255.255.255.255", PORT)).map(|_| ())
++    }
++
++    /// Read everything waiting, add valid announcements from others to
++    /// `peers`. Never blocks.
++    pub fn poll(&self, own_instance: u64, peers: &mut Peers, now: Instant) {
++        let mut buf = [0u8; MAX_PACKET];
++        loop {
++            match self.sock.recv_from(&mut buf) {
++                // A full buffer may have been cut off: don't trust it.
++                Ok((n, _)) if n >= MAX_PACKET => continue,
++                Ok((n, from)) => {
++                    if let Some(a) = std::str::from_utf8(&buf[..n]).ok().and_then(decode) {
++                        if a.instance != own_instance {
++                            peers.update(from.ip(), a, now);
++                        }
++                    }
++                }
++                Err(_) => break, // WouldBlock: nothing more waiting
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::net::Ipv4Addr;
++
++    fn sample() -> Announce {
++        Announce { instance: 0xABCD, nick: "Sam".into(), game: "Minecraft".into(), port: 25565, players: 2, max_players: 8 }
++    }
++
++    #[test]
++    fn encode_then_decode_round_trips() {
++        assert_eq!(decode(&encode(&sample())), Some(sample()));
++    }
++
++    #[test]
++    fn tabs_and_newlines_cannot_break_the_format() {
++        let mut a = sample();
++        a.nick = "evil\tname\nhere".into();
++        let back = decode(&encode(&a)).expect("still valid");
++        assert_eq!(back.nick, "evilnamehere");
++        assert_eq!(back.game, "Minecraft");
++    }
++
++    #[test]
++    fn long_text_is_truncated() {
++        let mut a = sample();
++        a.game = "x".repeat(500);
++        assert_eq!(decode(&encode(&a)).unwrap().game.chars().count(), MAX_TEXT);
++    }
++
++    #[test]
++    fn junk_is_rejected() {
++        for bad in ["", "hello", "SIRLAN1", "SIRLAN2\t1\ta\tb\t1\t1\t1", "SIRLAN1\tzz\ta\tb\t1\t1\t1", "SIRLAN1\t1\ta\tb\t0\t1\t1", "SIRLAN1\t1\ta\t\t1\t1\t1", "SIRLAN1\t1\ta\tb\t99999\t1\t1", "SIRLAN1\t1\ta\tb\t1\t1\t1\textra"] {
++            assert_eq!(decode(bad), None, "{bad:?}");
++        }
++    }
++
++    #[test]
++    fn hosts_expire_and_are_sorted() {
++        let t0 = Instant::now();
++        let ip = |n| IpAddr::V4(Ipv4Addr::new(192, 168, 0, n));
++        let mut peers = Peers::default();
++        peers.update(ip(5), Announce { game: "Zed".into(), ..sample() }, t0);
++        peers.update(ip(6), Announce { instance: 2, game: "Alpha".into(), ..sample() }, t0);
++        let games: Vec<_> = peers.live(t0).iter().map(|h| h.announce.game.clone()).collect();
++        assert_eq!(games, ["Alpha", "Zed"]);
++        assert!(peers.live(t0 + TTL + Duration::from_secs(1)).is_empty());
++    }
++
++    #[test]
++    fn the_host_table_cannot_be_flooded() {
++        let t0 = Instant::now();
++        let mut peers = Peers::default();
++        for i in 0..(MAX_HOSTS as u64 + 100) {
++            peers.update(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), Announce { instance: i, ..sample() }, t0);
++        }
++        assert_eq!(peers.live(t0).len(), MAX_HOSTS);
++    }
++
++    #[test]
++    fn the_join_template_only_inserts_address_and_port() {
++        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20));
++        assert_eq!(fill_template("--connect {ip}:{port}", ip, 25565), "--connect 192.168.1.20:25565");
++        assert_eq!(fill_template("-nojoin", ip, 1), "-nojoin");
++    }
++}
+diff --git a/crates/localgames/src/lib.rs b/crates/localgames/src/lib.rs
+new file mode 100644
+index 0000000..654706d
+--- /dev/null
++++ b/crates/localgames/src/lib.rs
+@@ -0,0 +1,19 @@
++//! # Local games
++//!
++//! Everything about games that don't come from Steam: a library you add
++//! programs to (or import from a folder, itch.io or Minecraft), art and
++//! descriptions fetched from the internet, and LAN discovery.
++//!
++//! The modules `id`, `exe`, `text` and `lan` use only the standard library on
++//! purpose: they hold the logic that must be exactly right and are easy to
++//! test in isolation.
++
++pub mod exe;
++pub mod fetch;
++pub mod id;
++pub mod lan;
++pub mod library;
++pub mod scan;
++pub mod text;
++
++pub use library::{Art, LocalGame, Meta, Source, Store};
+diff --git a/crates/localgames/src/library.rs b/crates/localgames/src/library.rs
+new file mode 100644
+index 0000000..c66919a
+--- /dev/null
++++ b/crates/localgames/src/library.rs
+@@ -0,0 +1,195 @@
++//! The saved list of local games.
++
++use crate::id;
++use serde::{Deserialize, Serialize};
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
++pub enum Source {
++    /// Added by hand.
++    #[default]
++    Manual,
++    /// Found by scanning a games folder.
++    Folder,
++    Itch,
++    Minecraft,
++}
++
++/// Pictures for a game, as web addresses (the app's image cache keeps them on
++/// disk, so they still show offline once seen).
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Art {
++    /// Wide banner behind the game's page.
++    pub hero: Option<String>,
++    /// Tall box art for the library grid.
++    pub cover: Option<String>,
++    /// Small square icon.
++    pub icon: Option<String>,
++    /// Transparent title logo.
++    pub logo: Option<String>,
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Meta {
++    pub description: String,
++    pub developers: Vec<String>,
++    pub publishers: Vec<String>,
++    pub release_date: String,
++    pub genres: Vec<String>,
++    /// Features like "Single-player", "Co-op", "Steam Achievements".
++    pub features: Vec<String>,
++    pub website: String,
++    /// The Steam game this was matched to, if any.
++    pub steam_app_id: Option<u32>,
++}
++
++impl Meta {
++    pub fn is_empty(&self) -> bool {
++        self.description.is_empty() && self.developers.is_empty() && self.genres.is_empty() && self.steam_app_id.is_none()
++    }
++}
++
++#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct LocalGame {
++    pub name: String,
++    pub exe: String,
++    pub args: String,
++    pub source: Source,
++    pub art: Art,
++    pub meta: Meta,
++    pub notes: String,
++    /// A line shown to Steam friends while playing (rich presence).
++    pub status: String,
++    /// Seconds played with this launcher.
++    pub playtime_secs: u64,
++    /// Unix time of the last session's start.
++    pub last_played: Option<u64>,
++    pub added: u64,
++    /// Launch options to join a LAN host; `{ip}` and `{port}` are replaced.
++    pub join_args: String,
++    /// The game's own port when hosting a LAN game (0 = not set).
++    pub host_port: u16,
++    /// Hand-chosen art and info should survive a refresh.
++    pub art_locked: bool,
++}
++
++impl LocalGame {
++    pub fn new(name: impl Into<String>, exe: impl Into<String>, source: Source, now: u64) -> Self {
++        Self { name: name.into(), exe: exe.into(), source, added: now, ..Default::default() }
++    }
++
++    /// The id Steam uses for this game (see [`id::game_id`]).
++    pub fn game_id(&self) -> u64 {
++        id::game_id(&self.exe, &self.name)
++    }
++
++    pub fn same_program(&self, exe: &str) -> bool {
++        self.exe.eq_ignore_ascii_case(exe)
++    }
++}
++
++/// Everything saved: the games, plus the few settings that go with them.
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++#[serde(default)]
++pub struct Store {
++    pub games: Vec<LocalGame>,
++    /// SteamGridDB key (optional), for more art than the official store has.
++    pub sgdb_key: String,
++    /// Folder scanned for games.
++    pub games_folder: String,
++}
++
++impl Store {
++    /// A damaged or missing save is an empty library, never a crash.
++    pub fn from_json(s: &str) -> Self {
++        serde_json::from_str(s).unwrap_or_default()
++    }
++
++    pub fn to_json(&self) -> Option<String> {
++        serde_json::to_string(self).ok()
++    }
++
++    /// Add a game unless that program is already in the library. Returns its index.
++    pub fn add(&mut self, g: LocalGame) -> Result<usize, usize> {
++        if let Some(i) = self.games.iter().position(|x| x.same_program(&g.exe)) {
++            return Err(i);
++        }
++        self.games.push(g);
++        Ok(self.games.len() - 1)
++    }
++
++    /// Time played: add a finished session.
++    pub fn record_session(&mut self, index: usize, started: u64, secs: u64) {
++        if let Some(g) = self.games.get_mut(index) {
++            g.playtime_secs = g.playtime_secs.saturating_add(secs);
++            g.last_played = Some(started);
++        }
++    }
++
++    /// Most recently played first.
++    pub fn recent(&self) -> Vec<usize> {
++        let mut v: Vec<usize> = (0..self.games.len()).filter(|&i| self.games[i].last_played.is_some()).collect();
++        v.sort_by_key(|&i| std::cmp::Reverse(self.games[i].last_played));
++        v
++    }
++}
++
++/// "2h 15m", "40m", "less than a minute".
++pub fn format_playtime(secs: u64) -> String {
++    match secs {
++        0..=59 => "less than a minute".into(),
++        60..=3599 => format!("{}m", secs / 60),
++        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_broken_save_is_an_empty_library() {
++        assert!(Store::from_json("{not json").games.is_empty());
++        assert!(Store::from_json("").games.is_empty());
++    }
++
++    #[test]
++    fn saves_round_trip_and_old_saves_without_new_fields_load() {
++        let mut s = Store::default();
++        s.add(LocalGame::new("Hades", r"C:\G\Hades.exe", Source::Manual, 5)).unwrap();
++        let back = Store::from_json(&s.to_json().unwrap());
++        assert_eq!(back.games, s.games);
++        let old = Store::from_json(r#"{"games":[{"name":"Old","exe":"o.exe"}]}"#);
++        assert_eq!(old.games[0].name, "Old");
++        assert_eq!(old.games[0].playtime_secs, 0);
++    }
++
++    #[test]
++    fn the_same_program_is_not_added_twice_whatever_its_case() {
++        let mut s = Store::default();
++        assert_eq!(s.add(LocalGame::new("A", r"C:\G\a.exe", Source::Manual, 0)), Ok(0));
++        assert_eq!(s.add(LocalGame::new("A again", r"c:\g\A.EXE", Source::Folder, 0)), Err(0));
++        assert_eq!(s.games.len(), 1);
++    }
++
++    #[test]
++    fn sessions_add_up_and_recent_is_ordered() {
++        let mut s = Store::default();
++        s.add(LocalGame::new("A", "a.exe", Source::Manual, 0)).unwrap();
++        s.add(LocalGame::new("B", "b.exe", Source::Manual, 0)).unwrap();
++        s.record_session(0, 100, 30);
++        s.record_session(0, 100, 40);
++        s.record_session(1, 200, 5);
++        assert_eq!(s.games[0].playtime_secs, 70);
++        assert_eq!(s.recent(), vec![1, 0]);
++    }
++
++    #[test]
++    fn playtime_reads_naturally() {
++        assert_eq!(format_playtime(5), "less than a minute");
++        assert_eq!(format_playtime(2400), "40m");
++        assert_eq!(format_playtime(8100), "2h 15m");
++    }
++}
+diff --git a/crates/localgames/src/scan.rs b/crates/localgames/src/scan.rs
+new file mode 100644
+index 0000000..e9ca4e0
+--- /dev/null
++++ b/crates/localgames/src/scan.rs
+@@ -0,0 +1,149 @@
++//! Finding games already on this PC: a games folder, the itch.io app's
++//! library, and the Minecraft launcher.
++//!
++//! These only read folders and files; nothing is changed.
++
++use crate::exe::{find_exes, pick_main};
++use crate::library::Source;
++use crate::text::display_name;
++use std::io::Read;
++use std::path::{Path, PathBuf};
++
++/// A game found on disk, not yet in the library.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct Found {
++    pub name: String,
++    pub exe: PathBuf,
++    pub source: Source,
++    /// A cover picture the source itself knows (itch.io has one per game).
++    pub cover_url: Option<String>,
++}
++
++/// Each folder directly inside `root` is treated as one game.
++pub fn scan_folder(root: &Path) -> Vec<Found> {
++    let mut out = Vec::new();
++    let Ok(entries) = std::fs::read_dir(root) else { return out };
++    for entry in entries.flatten() {
++        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
++            continue;
++        }
++        let folder = entry.file_name().to_string_lossy().to_string();
++        let exes = find_exes(&entry.path(), 3);
++        if let Some(main) = pick_main(&folder, &exes) {
++            out.push(Found { name: display_name(&folder), exe: main.path.clone(), source: Source::Folder, cover_url: None });
++        }
++    }
++    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
++    out
++}
++
++/// Where the itch.io app keeps installed games, if it is installed.
++pub fn itch_apps_dir() -> Option<PathBuf> {
++    let dir = PathBuf::from(std::env::var_os("APPDATA")?).join("itch").join("apps");
++    dir.is_dir().then_some(dir)
++}
++
++/// What the itch.io app wrote about a game when it installed it
++/// (`.itch/receipt.json.gz`): its title and cover picture.
++fn itch_receipt(game_dir: &Path) -> Option<(String, Option<String>)> {
++    let file = std::fs::File::open(game_dir.join(".itch").join("receipt.json.gz")).ok()?;
++    let mut json = String::new();
++    // A receipt is a few kilobytes; cap what we read from a file we don't control.
++    flate2::read::GzDecoder::new(file).take(1 << 20).read_to_string(&mut json).ok()?;
++    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
++    let game = v.get("game")?;
++    let title = game.get("title")?.as_str()?.trim().to_string();
++    let cover = game.get("coverUrl").and_then(|c| c.as_str()).filter(|c| c.starts_with("https://")).map(String::from);
++    (!title.is_empty()).then_some((title, cover))
++}
++
++/// Games installed with the itch.io app.
++pub fn scan_itch() -> Vec<Found> {
++    let Some(apps) = itch_apps_dir() else { return Vec::new() };
++    let mut out = Vec::new();
++    let Ok(entries) = std::fs::read_dir(&apps) else { return out };
++    for entry in entries.flatten() {
++        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
++            continue;
++        }
++        let dir = entry.path();
++        let folder = entry.file_name().to_string_lossy().to_string();
++        let (name, cover_url) = itch_receipt(&dir).unwrap_or_else(|| (display_name(&folder), None));
++        let exes = find_exes(&dir, 3);
++        if let Some(main) = pick_main(&name, &exes).or_else(|| pick_main(&folder, &exes)) {
++            out.push(Found { name, exe: main.path.clone(), source: Source::Itch, cover_url });
++        }
++    }
++    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
++    out
++}
++
++/// The Minecraft launcher, when installed in one of its usual places.
++pub fn scan_minecraft() -> Vec<Found> {
++    let mut candidates: Vec<PathBuf> = Vec::new();
++    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
++        if let Some(base) = std::env::var_os(var) {
++            candidates.push(PathBuf::from(base).join("Minecraft Launcher").join("MinecraftLauncher.exe"));
++        }
++    }
++    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
++        candidates.push(PathBuf::from(base).join("Programs").join("Minecraft Launcher").join("MinecraftLauncher.exe"));
++    }
++    candidates
++        .into_iter()
++        .find(|p| p.is_file())
++        .map(|exe| vec![Found { name: "Minecraft".into(), exe, source: Source::Minecraft, cover_url: None }])
++        .unwrap_or_default()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::io::Write;
++
++    fn temp(name: &str) -> PathBuf {
++        let p = std::env::temp_dir().join(format!("sir-scan-{name}-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&p);
++        std::fs::create_dir_all(&p).unwrap();
++        p
++    }
++
++    #[test]
++    fn a_games_folder_yields_one_game_per_subfolder() {
++        let root = temp("folder");
++        std::fs::create_dir_all(root.join("Dead_Cells-v1.2")).unwrap();
++        std::fs::write(root.join("Dead_Cells-v1.2").join("deadcells.exe"), b"x").unwrap();
++        std::fs::write(root.join("Dead_Cells-v1.2").join("unins000.exe"), vec![0u8; 100]).unwrap();
++        std::fs::create_dir_all(root.join("Empty")).unwrap();
++        std::fs::write(root.join("loose.exe"), b"x").unwrap();
++        let found = scan_folder(&root);
++        assert_eq!(found.len(), 1);
++        assert_eq!(found[0].name, "Dead Cells");
++        assert!(found[0].exe.ends_with("deadcells.exe"));
++        let _ = std::fs::remove_dir_all(&root);
++    }
++
++    #[test]
++    fn an_itch_receipt_gives_title_and_cover() {
++        let dir = temp("itch");
++        std::fs::create_dir_all(dir.join(".itch")).unwrap();
++        let json = br#"{"game":{"title":"Night in the Woods","coverUrl":"https://img.itch.zone/c.png"}}"#;
++        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
++        gz.write_all(json).unwrap();
++        std::fs::write(dir.join(".itch").join("receipt.json.gz"), gz.finish().unwrap()).unwrap();
++        let (title, cover) = itch_receipt(&dir).unwrap();
++        assert_eq!(title, "Night in the Woods");
++        assert_eq!(cover.as_deref(), Some("https://img.itch.zone/c.png"));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++
++    #[test]
++    fn a_missing_or_broken_receipt_is_just_none() {
++        let dir = temp("itch-bad");
++        assert!(itch_receipt(&dir).is_none());
++        std::fs::create_dir_all(dir.join(".itch")).unwrap();
++        std::fs::write(dir.join(".itch").join("receipt.json.gz"), b"not gzip").unwrap();
++        assert!(itch_receipt(&dir).is_none());
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++}
+diff --git a/crates/localgames/src/text.rs b/crates/localgames/src/text.rs
+new file mode 100644
+index 0000000..ad52cca
+--- /dev/null
++++ b/crates/localgames/src/text.rs
+@@ -0,0 +1,178 @@
++//! Small text helpers: matching a game's name against search results and
++//! cleaning descriptions fetched from the web.
++
++/// Lowercase letters and digits only, so "The Witness™" and "the witness"
++/// compare equal.
++pub fn normalize(s: &str) -> String {
++    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
++}
++
++/// A folder name turned into a display name: separators become spaces and
++/// version or build tags are dropped ("My_Game-v1.2.3" -> "My Game").
++pub fn display_name(folder: &str) -> String {
++    let folder = cut_version(folder);
++    let spaced: String = folder.chars().map(|c| if matches!(c, '_' | '.') { ' ' } else { c }).collect();
++    let mut words: Vec<&str> = Vec::new();
++    for w in spaced.split_whitespace() {
++        let lower = w.to_ascii_lowercase();
++        let looks_like_version = lower.strip_prefix('v').is_some_and(|r| r.chars().next().is_some_and(|c| c.is_ascii_digit()));
++        let is_tag = matches!(lower.as_str(), "win64" | "win32" | "x64" | "x86" | "windows" | "portable" | "setup" | "build");
++        if looks_like_version || is_tag {
++            continue;
++        }
++        words.push(w.trim_matches('-'));
++    }
++    let name = words.into_iter().filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ");
++    if name.is_empty() { folder.trim().to_string() } else { name }
++}
++
++/// Everything before a "-v1.2"-style suffix ("My_Game-v1.2.3" -> "My_Game").
++fn cut_version(s: &str) -> &str {
++    let b = s.as_bytes();
++    for i in 0..b.len().saturating_sub(2) {
++        if matches!(b[i], b'-' | b'_' | b' ' | b'.') && matches!(b[i + 1], b'v' | b'V') && b[i + 2].is_ascii_digit() {
++            return &s[..i];
++        }
++    }
++    s
++}
++
++/// Which of `titles` is the game called `query`? Only a confident match is
++/// returned: an exact (normalized) match, else one title that contains the
++/// whole query or is contained by it. Anything unclear returns `None`, so
++/// the person picks instead of getting wrong art.
++pub fn best_match(query: &str, titles: &[&str]) -> Option<usize> {
++    let q = normalize(query);
++    if q.len() < 2 {
++        return None;
++    }
++    if let Some(i) = titles.iter().position(|t| normalize(t) == q) {
++        return Some(i);
++    }
++    let close: Vec<usize> = titles
++        .iter()
++        .enumerate()
++        .filter(|(_, t)| {
++            let t = normalize(t);
++            t.len() >= 3 && (t.starts_with(&q) || q.starts_with(&t))
++        })
++        .map(|(i, _)| i)
++        .collect();
++    // Only when exactly one result fits: two sequels both fit "Portal".
++    if close.len() == 1 { Some(close[0]) } else { None }
++}
++
++/// Split launch options into arguments: spaces separate them, double quotes
++/// keep spaces together (`--name "Two Words"` is two arguments).
++pub fn split_args(s: &str) -> Vec<String> {
++    let mut out = Vec::new();
++    let mut cur = String::new();
++    let mut quoted = false;
++    let mut started = false;
++    for c in s.chars() {
++        match c {
++            '"' => {
++                quoted = !quoted;
++                started = true;
++            }
++            c if c.is_whitespace() && !quoted => {
++                if started {
++                    out.push(std::mem::take(&mut cur));
++                    started = false;
++                }
++            }
++            c => {
++                cur.push(c);
++                started = true;
++            }
++        }
++    }
++    if started {
++        out.push(cur);
++    }
++    out
++}
++
++/// Plain text from the small bit of HTML store descriptions contain.
++pub fn strip_html(s: &str) -> String {
++    let mut out = String::with_capacity(s.len());
++    let mut tag: Option<String> = None;
++    for c in s.chars() {
++        match (&mut tag, c) {
++            (None, '<') => tag = Some(String::new()),
++            (Some(name), '>') => {
++                // Line-breaking tags separate words; inline ones (<b>) don't.
++                let n = name.trim_start_matches('/').to_ascii_lowercase();
++                if ["br", "p", "li", "div", "h1", "h2", "h3", "ul", "ol"].iter().any(|b| n == *b || n.starts_with(&format!("{b} ")) || n.starts_with(&format!("{b}/"))) {
++                    out.push(' ');
++                }
++                tag = None;
++            }
++            (Some(name), c) => name.push(c),
++            (None, c) => out.push(c),
++        }
++    }
++    let out = out
++        .replace("&quot;", "\"")
++        .replace("&#39;", "'")
++        .replace("&apos;", "'")
++        .replace("&lt;", "<")
++        .replace("&gt;", ">")
++        .replace("&nbsp;", " ")
++        .replace("&amp;", "&");
++    out.split_whitespace().collect::<Vec<_>>().join(" ")
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn normalize_ignores_case_and_symbols() {
++        assert_eq!(normalize("The Witness™"), "thewitness");
++        assert_eq!(normalize("HADES"), normalize("hades"));
++    }
++
++    #[test]
++    fn display_name_drops_separators_and_versions() {
++        assert_eq!(display_name("My_Game-v1.2.3"), "My Game");
++        assert_eq!(display_name("Celeste_win64"), "Celeste");
++        assert_eq!(display_name("Dead.Cells"), "Dead Cells");
++        assert_eq!(display_name("v1"), "v1");
++    }
++
++    #[test]
++    fn exact_match_wins_even_with_sequels_listed() {
++        let titles = ["Portal 2", "Portal", "Portal Stories: Mel"];
++        assert_eq!(best_match("portal", &titles), Some(1));
++    }
++
++    #[test]
++    fn ambiguous_or_unrelated_results_are_not_guessed() {
++        assert_eq!(best_match("Portal", &["Portal 2", "Portal Stories: Mel"]), None);
++        assert_eq!(best_match("Hades", &["Minecraft"]), None);
++        assert_eq!(best_match("x", &["X"]), None);
++    }
++
++    #[test]
++    fn a_single_close_title_is_accepted() {
++        assert_eq!(best_match("Hades", &["Hades II", "Minecraft"]), Some(0));
++    }
++
++    #[test]
++    fn launch_options_split_like_a_command_line() {
++        assert_eq!(split_args("-windowed  -w 1280"), ["-windowed", "-w", "1280"]);
++        assert_eq!(split_args(r#"--name "Two Words" -x"#), ["--name", "Two Words", "-x"]);
++        assert_eq!(split_args(r#""" a"#), ["", "a"]);
++        assert!(split_args("   ").is_empty());
++        assert!(split_args("").is_empty());
++    }
++
++    #[test]
++    fn strip_html_removes_tags_and_decodes_entities() {
++        assert_eq!(strip_html("Fight &amp; <b>escape</b><br>the &quot;Underworld&quot;"), "Fight & escape the \"Underworld\"");
++        assert_eq!(strip_html("<p>One</p><p>Two</p>"), "One Two");
++        assert_eq!(strip_html("a <b>bold</b>."), "a bold.");
++        assert_eq!(strip_html("1 < 2"), "1");
++    }
++}
+diff --git a/docs/local-games.md b/docs/local-games.md
+new file mode 100644
+index 0000000..9389a93
+--- /dev/null
++++ b/docs/local-games.md
+@@ -0,0 +1,62 @@
++# Local games
++
++Games that aren't on Steam get their own page in SteamInRust: **Local games**
++(top navigation, between Library and Community).
++
++## What it does
++
++| | |
++| --- | --- |
++| **Add games** | One program, a whole games folder (each subfolder is a game), the itch.io app's library, or the Minecraft launcher. The right `.exe` is picked for you (uninstallers, crash handlers and redistributables are skipped). |
++| **Art and details** | When a game is added, its banner (hero), cover, icon, logo, description, developer, genres and features are looked up on the internet. A clear match is applied automatically. If the match isn't clear, nothing is guessed: open the game's **Properties** tab, search, and choose the right one. Every picture can be swapped by hand, and a hand-picked look is never overwritten. |
++| **Steam-style game page** | Hero banner, play bar (Play/Stop, play time, last played), and a feature bar underneath: **About**, **Notes**, **LAN play**, **Properties**. |
++| **Friends see what you play** | While a local game runs, Steam friends see "Playing *name*", the same as for a shortcut added in the official client (the game gets the same shortcut-style id Steam would give it). You can set a status line per game. |
++| **Play time** | Counted per game, kept on this PC. |
++| **LAN play** | Hosts announce themselves over UDP on the local network; the LAN tab lists who is hosting your game and starts it with the host's address filled into your launch options (`--connect {ip}:{port}`). Discovery only: the game's own multiplayer does the playing. |
++| **Offline** | Everything works offline. Art and details already seen are served from the image cache; lookups that fail offline are retried when you search again or re-add the game. |
++
++## Settings
++
++*Settings > Local games*: an optional free [SteamGridDB](https://www.steamgriddb.com)
++API key (adds many community banners, covers, icons and logos; indie and itch.io
++games usually have nothing else) and your games folder.
++
++## Where things are
++
++```
++crates/localgames/     the logic, no UI
++  id.rs                Steam's non-Steam-game id (CRC-32 based)
++  exe.rs               choosing a game's main program
++  text.rs              name matching, launch-option splitting, HTML cleanup
++  lan.rs               LAN announcements (UDP), host table
++  scan.rs              games folder, itch.io, Minecraft
++  fetch.rs             Steam store + SteamGridDB lookups
++  library.rs           the saved list
++crates/client/         Command::SetLocalPlaying / ClearLocalPlaying
++apps/desktop/src/builtin/local_games.rs    the page
++```
++
++`id`, `exe`, `text` and `lan` use only the standard library on purpose.
++
++## Testing
++
++```
++cargo test -p localgames
++```
++
++## Known limits
++
++- **Rich presence.** Steam shows "Playing *name*" for sure. A custom status
++  line is uploaded as rich presence, but whether a friend's client shows it for
++  a non-Steam game is up to their client; it has not been checked against one.
++- **Launcher-style games.** Play time and presence follow the process that was
++  started. If a game's `.exe` is only a launcher that starts the real game and
++  exits, tracking ends when the launcher does. Minecraft's launcher stays open
++  by default; the Microsoft Store edition isn't imported.
++- **Overlay.** For these games the Shift+Tab overlay is the always-on-top
++  window (works over windowed and borderless games), not the in-game D3D11
++  overlay, which needs the game to load SteamInRust's `steamclient`.
++- **Steam game ids.** The shortcut-style id is computed from the program path and
++  name, so renaming a game or moving its `.exe` changes it. Friends see the new
++  name; nothing else is affected.
++- **Strings** are English only so far (not yet in `locales/ru.toml`).
+-- 
+2.43.0
+
